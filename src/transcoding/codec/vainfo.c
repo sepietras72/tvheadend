@@ -50,6 +50,8 @@ int encoder_vp8_isavailable = 0;
 int encoder_vp8lp_isavailable = 0;
 int encoder_vp9_isavailable = 0;
 int encoder_vp9lp_isavailable = 0;
+int encoder_av1_isavailable = 0;
+int encoder_av1lp_isavailable = 0;
 
 int encoder_h264_maxBfreames = 0;
 int encoder_h264lp_maxBfreames = 0;
@@ -59,6 +61,8 @@ int encoder_vp8_maxBfreames = 0;
 int encoder_vp8lp_maxBfreames = 0;
 int encoder_vp9_maxBfreames = 0;
 int encoder_vp9lp_maxBfreames = 0;
+int encoder_av1_maxBfreames = 0;
+int encoder_av1lp_maxBfreames = 0;
 
 int encoder_h264_maxQuality = 0;
 int encoder_h264lp_maxQuality = 0;
@@ -68,6 +72,8 @@ int encoder_vp8_maxQuality = 0;
 int encoder_vp8lp_maxQuality = 0;
 int encoder_vp9_maxQuality = 0;
 int encoder_vp9lp_maxQuality = 0;
+int encoder_av1_maxQuality = 0;
+int encoder_av1lp_maxQuality = 0;
 
 #if ENABLE_VAAPI
 /**
@@ -379,6 +385,23 @@ int init(int show_log)
                     }
                 }
             }
+            // av1
+            if (profile == VAProfileAV1Profile0 || profile == VAProfileAV1Profile1) {
+                if (entrypoints[entrypoint] == VAEntrypointEncSlice) {
+                    encoder_av1_isavailable = 1;
+                    ret_val = get_config_attributes(va_dpy, profile_list[i], entrypoints[entrypoint], show_log, VAINFO_AV1);
+                    if (ret_val) {
+                        tvherror_transcode(LST_VAINFO, "Failed to get config attributes (error %d)", ret_val);
+                    }
+                }
+                if (entrypoints[entrypoint] == VAEntrypointEncSliceLP) {
+                    encoder_av1lp_isavailable = 1;
+                    ret_val = get_config_attributes(va_dpy, profile_list[i], entrypoints[entrypoint], show_log, VAINFO_AV1_LOW_POWER);
+                    if (ret_val) {
+                        tvherror_transcode(LST_VAINFO, "Failed to get config attributes (error %d)", ret_val);
+                    }
+                }
+            }
         }
     }
     init_done = 1;
@@ -467,6 +490,10 @@ int vainfo_encoder_isavailable(int codec)
                 return encoder_vp9_isavailable;
             case VAINFO_VP9_LOW_POWER:
                 return encoder_vp9lp_isavailable;
+            case VAINFO_AV1:
+                return encoder_av1_isavailable;
+            case VAINFO_AV1_LOW_POWER:
+                return encoder_av1lp_isavailable;
             default:
                 tvherror_transcode(LST_VAINFO, "codec not available: codec=%d", codec);
                 return CODEC_IS_NOT_AVAILABLE;
@@ -510,6 +537,10 @@ int vainfo_encoder_maxBfreames(int codec)
                 return encoder_vp9_maxBfreames;
             case VAINFO_VP9_LOW_POWER:
                 return encoder_vp9lp_maxBfreames;
+            case VAINFO_AV1:
+                return encoder_av1_maxBfreames;
+            case VAINFO_AV1_LOW_POWER:
+                return encoder_av1lp_maxBfreames;
             default:
                 tvherror_transcode(LST_VAINFO, "codec not available: codec=%d", codec);
                 return MIN_B_FRAMES;
@@ -553,6 +584,10 @@ int vainfo_encoder_maxQuality(int codec)
                 return encoder_vp9_maxQuality;
             case VAINFO_VP9_LOW_POWER:
                 return encoder_vp9lp_maxQuality;
+            case VAINFO_AV1:
+                return encoder_av1_maxQuality;
+            case VAINFO_AV1_LOW_POWER:
+                return encoder_av1lp_maxQuality;
             default:
                 tvherror_transcode(LST_VAINFO, "codec not available: codec=%d", codec);
                 return MIN_QUALITY;

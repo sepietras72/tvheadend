@@ -96,7 +96,8 @@ enum CODEC{
     H264 = 1,
     HEVC = 2,
     VP8 = 3,
-    VP9 = 4
+    VP9 = 4,
+    AV1 = 5
 };
 /* hts ==================================================================== */
 
@@ -236,6 +237,8 @@ TVH_CODEC_PROFILE_VAAPI_CODEC_UI(vp8lp, VP8_LOW_POWER)
 
 // static const int tvh_codec_profile_vaapi_vp9lp_ui(void)
 TVH_CODEC_PROFILE_VAAPI_CODEC_UI(vp9lp, VP9_LOW_POWER)
+TVH_CODEC_PROFILE_VAAPI_CODEC_UI(av1, AV1)
+TVH_CODEC_PROFILE_VAAPI_CODEC_UI(av1lp, AV1_LOW_POWER)
 
 static int
 tvh_codec_profile_vaapi_open(tvh_codec_profile_vaapi_t *self,
@@ -1465,6 +1468,161 @@ TVHVideoCodec tvh_codec_vaapi_vp9 = {
     .size     = sizeof(tvh_codec_profile_vaapi_t),
     .idclass  = &codec_profile_vaapi_vp9_class,
     .profiles = vaapi_vp9_profiles,
+    .profile_init = tvh_codec_profile_video_init,
+    .profile_destroy = tvh_codec_profile_video_destroy,
+};
+/* av1_vaapi ================================================================ */
+static const AVProfile vaapi_av1_profiles[] = {
+    { FF_AV_PROFILE_UNKNOWN },
+};
+static int
+tvh_codec_profile_vaapi_av1_open(tvh_codec_profile_vaapi_t *self,
+                                  AVDictionary **opts)
+{
+    TVHCodecProfile *p = (TVHCodecProfile *)self;
+    int int_bitrate = 0;
+    int int_buffer_size = 0;
+    int int_max_bitrate = 0;
+    int ret = 0;
+    compute_bitrates(self, &int_bitrate, &int_buffer_size, &int_max_bitrate);
+    if (self->rc_mode != VAAPI_ENC_PARAMS_RC_SKIP) {
+        AV_DICT_SET_INT(LST_VAAPI, opts, "rc_mode", self->rc_mode, AV_DICT_DONT_OVERWRITE);
+    }
+    if (self->tier >= 0) {
+        AV_DICT_SET_INT(LST_VAAPI, opts, "tier", self->tier, AV_DICT_DONT_OVERWRITE);
+    }
+    if (self->level >= 0) {
+        AV_DICT_SET_INT(LST_VAAPI, opts, "level", self->level, AV_DICT_DONT_OVERWRITE);
+    }
+    switch (self->platform) {
+        case VAAPI_ENC_PLATFORM_UNCONSTRAINED:
+            if ((ret = setup_opts_unconstrained(self, opts, AV1, int_bitrate, int_buffer_size, int_max_bitrate))) {
+                return ret;
+            }
+            break;
+        case VAAPI_ENC_PLATFORM_INTEL:
+            if (self->b_reference) {
+                AV_DICT_SET_INT(LST_VAAPI, opts, "b_depth", self->b_reference, AV_DICT_DONT_OVERWRITE);
+            }
+            if (self->desired_b_depth >= 0) {
+                AV_DICT_SET_INT(LST_VAAPI, opts, "bf", self->desired_b_depth, AV_DICT_DONT_OVERWRITE);
+            }
+            switch (self->rc_mode) {
+                case VAAPI_ENC_PARAMS_RC_SKIP:
+                case VAAPI_ENC_PARAMS_RC_AUTO:
+                    if ((ret = setup_bitrate_qp_opts_unconstrained(self, opts, int_bitrate, int_buffer_size, int_max_bitrate))) {
+                        return ret;
+                    }
+                    break;
+                case VAAPI_ENC_PARAMS_RC_CONSTQP:
+                case VAAPI_ENC_PARAMS_RC_ICQ:
+                    if (self->qp) {
+                        AV_DICT_SET_INT(LST_VAAPI, opts, "qp", self->qp, AV_DICT_DONT_OVERWRITE);
+                    }
+                    break;
+                case VAAPI_ENC_PARAMS_RC_CBR:
+                    if (p->bit_rate && self->buff_factor) {
+                        AV_DICT_SET_INT(LST_VAAPI, opts, "b", int_bitrate, AV_DICT_DONT_OVERWRITE);
+                        AV_DICT_SET_INT(LST_VAAPI, opts, "bufsize", int_buffer_size, AV_DICT_DONT_OVERWRITE);
+                    }
+                    break;
+                case VAAPI_ENC_PARAMS_RC_VBR:
+                    if (p->bit_rate && self->buff_factor) {
+                        AV_DICT_SET_INT(LST_VAAPI, opts, "b", int_bitrate, AV_DICT_DONT_OVERWRITE);
+                        AV_DICT_SET_INT(LST_VAAPI, opts, "maxrate", int_max_bitrate, AV_DICT_DONT_OVERWRITE);
+                        AV_DICT_SET_INT(LST_VAAPI, opts, "bufsize", int_buffer_size, AV_DICT_DONT_OVERWRITE);
+                    }
+                    break;
+                case VAAPI_ENC_PARAMS_RC_QVBR:
+                    if ((ret = setup_bitrate_qp_opts_unconstrained(self, opts, int_bitrate, int_buffer_size, int_max_bitrate))) {
+                        return ret;
+                    }
+                    break;
+                case VAAPI_ENC_PARAMS_RC_AVBR:
+                    if (p->bit_rate && self->buff_factor) {
+                        AV_DICT_SET_INT(LST_VAAPI, opts, "b", int_bitrate, AV_DICT_DONT_OVERWRITE);
+                        AV_DICT_SET_INT(LST_VAAPI, opts, "maxrate", int_max_bitrate, AV_DICT_DONT_OVERWRITE);
+                    }
+                    break;
+            }
+            if (self->low_power) {
+                AV_DICT_SET_INT(LST_VAAPI, opts, "low_power", self->low_power, AV_DICT_DONT_OVERWRITE);
+            }
+            if ((ret = setup_baseline_opts_unconstrained(self, opts, AV1))) {
+                return ret;
+            }
+            break;
+        case VAAPI_ENC_PLATFORM_AMD:
+            if ((ret = setup_common_opts_unconstrained(self, opts, AV1, int_bitrate, int_buffer_size, int_max_bitrate))) {
+                return ret;
+            }
+            AV_DICT_SET_INT(LST_VAAPI, opts, "bf", 0, 0);
+            break;
+    }
+    AV_DICT_SET(LST_VAAPI, opts, "force_key_frames", "expr:eq(t,0)+eq(t,1)", AV_DICT_DONT_OVERWRITE);
+    p->has_support_for_filter2 = 1;
+    return 0;
+}
+static const codec_profile_class_t codec_profile_vaapi_av1_class = {
+    {
+        .ic_super      = (idclass_t *)&codec_profile_vaapi_class,
+        .ic_class      = "codec_profile_vaapi_av1",
+        .ic_caption    = N_("av1_vaapi"),
+        .ic_properties = (const property_t[]){
+            {
+                .type     = PT_INT,
+                .id       = "tier",     // Don't change
+                .name     = N_("Tier"),
+                .desc     = N_("Set tier (seq_tier) [-1=skip, 0=Main, 1=High]."),
+                .group    = 5,
+                .opts     = PO_EXPERT,
+                .get_opts = codec_profile_class_get_opts,
+                .off      = offsetof(tvh_codec_profile_vaapi_t, tier),
+                .intextra = INTEXTRA_RANGE(-1, 1, 1),
+                .def.i    = -1,
+            },
+            {
+                .type     = PT_INT,
+                .id       = "level",     // Don't change
+                .name     = N_("Level"),
+                .desc     = N_("Set level (seq_level_idx) [-99=auto, 0-19]."),
+                .group    = 5,
+                .opts     = PO_EXPERT,
+                .get_opts = codec_profile_class_get_opts,
+                .off      = offsetof(tvh_codec_profile_vaapi_t, level),
+                .intextra = INTEXTRA_RANGE(-99, 19, 1),
+                .def.i    = -99,
+            },
+            {
+                .type     = PT_DYN_INT,
+                .id       = "ui",     // Don't change
+                .name     = N_("User Interface"),
+                .desc     = N_("User Interface (bits will show what features are available)."),
+                .group    = 3,
+                .opts     = PO_PHIDDEN,
+                .off      = offsetof(tvh_codec_profile_vaapi_t, ui),
+                .def.dyn_i= tvh_codec_profile_vaapi_av1_ui,
+            },
+            {
+                .type     = PT_DYN_INT,
+                .id       = "uilp",     // Don't change
+                .name     = N_("User Interface (low power)"),
+                .desc     = N_("User Interface (bits will show what features are available)."),
+                .group    = 3,
+                .opts     = PO_PHIDDEN,
+                .off      = offsetof(tvh_codec_profile_vaapi_t, uilp),
+                .def.dyn_i= tvh_codec_profile_vaapi_av1lp_ui,
+            },
+            {}
+        }
+    },
+    .open = (codec_profile_open_meth)tvh_codec_profile_vaapi_av1_open,
+};
+TVHVideoCodec tvh_codec_vaapi_av1 = {
+    .name     = "av1_vaapi",
+    .size     = sizeof(tvh_codec_profile_vaapi_t),
+    .idclass  = &codec_profile_vaapi_av1_class,
+    .profiles = vaapi_av1_profiles,
     .profile_init = tvh_codec_profile_video_init,
     .profile_destroy = tvh_codec_profile_video_destroy,
 };

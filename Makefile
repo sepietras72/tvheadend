@@ -624,6 +624,12 @@ SRCS-CAPMT = \
 SRCS-${CONFIG_CAPMT} += $(SRCS-CAPMT)
 I18N-C += $(SRCS-CAPMT)
 
+# CAPMT2
+SRCS-CAPMT2 = \
+	src/descrambler/capmt2.c
+SRCS-${CONFIG_CAPMT2} += $(SRCS-CAPMT2)
+I18N-C += $(SRCS-CAPMT2)
+
 # CONSTCW
 SRCS-CONSTCW = \
 	src/descrambler/constcw.c

@@ -70,6 +70,7 @@ extern TVHCodec tvh_codec_vaapi_h264;
 extern TVHCodec tvh_codec_vaapi_hevc;
 extern TVHCodec tvh_codec_vaapi_vp8;
 extern TVHCodec tvh_codec_vaapi_vp9;
+extern TVHCodec tvh_codec_vaapi_av1;
 #endif
 
 #if ENABLE_QSV
@@ -356,12 +357,16 @@ tvh_codecs_register()
         if (vainfo_encoder_isavailable(VAINFO_VP9) || 
             vainfo_encoder_isavailable(VAINFO_VP9_LOW_POWER))
             tvh_codec_register(&tvh_codec_vaapi_vp9);
+        if (vainfo_encoder_isavailable(VAINFO_AV1) || 
+            vainfo_encoder_isavailable(VAINFO_AV1_LOW_POWER))
+            tvh_codec_register(&tvh_codec_vaapi_av1);
     }
     else {
         tvh_codec_register(&tvh_codec_vaapi_h264);
         tvh_codec_register(&tvh_codec_vaapi_hevc);
         tvh_codec_register(&tvh_codec_vaapi_vp8);
         tvh_codec_register(&tvh_codec_vaapi_vp9);
+        tvh_codec_register(&tvh_codec_vaapi_av1);
     }
 #endif
 

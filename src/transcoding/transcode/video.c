@@ -64,7 +64,7 @@ get_encoder_hw_device_type(AVCodecContext *avctx)
     // check VAAPI encoder
     if (avctx->codec &&
         (strstr(avctx->codec->name, "mpeg2_vaapi") || strstr(avctx->codec->name, "h264_vaapi") || strstr(avctx->codec->name, "hevc_vaapi") ||
-        strstr(avctx->codec->name, "vp9_vaapi") || strstr(avctx->codec->name, "vp8_vaapi"))) {
+        strstr(avctx->codec->name, "vp9_vaapi") || strstr(avctx->codec->name, "vp8_vaapi") || strstr(avctx->codec->name, "av1_vaapi"))) {
             return AV_HWDEVICE_TYPE_VAAPI;
     }
 #endif

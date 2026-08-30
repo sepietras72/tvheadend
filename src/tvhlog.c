@@ -145,6 +145,7 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
   [LS_CACLIENT]      = { "caclient",      N_("CA (descrambling) Client") },
   [LS_CSA]           = { "csa",           N_("CSA (descrambling)") },
   [LS_CAPMT]         = { "capmt",         N_("CAPMT CA Client") },
+  [LS_CAPMT2]        = { "capmt2",        N_("CAPMT2 CA Client (OSCam, incremental)") },
   [LS_CWC]           = { "cwc",           N_("CWC CA Client") },
   [LS_CCCAM]         = { "cccam",         N_("CWC CCCam Client") },
   [LS_DVBCAM]        = { "dvbcam",        N_("DVB CAM Client") },

@@ -164,6 +164,7 @@ enum {
   LS_CACLIENT,
   LS_CSA,
   LS_CAPMT,
+  LS_CAPMT2,
   LS_CWC,
   LS_CCCAM,
   LS_DVBCAM,

@@ -34,6 +34,9 @@ const idclass_t *caclient_classes[] = {
 #if ENABLE_CAPMT
   &caclient_capmt_class,
 #endif
+#if ENABLE_CAPMT2
+  &caclient_capmt2_class,
+#endif
 #if ENABLE_CONSTCW
   &caclient_ccw_csa_cbc_class,
   &caclient_ccw_des_ncb_class,
@@ -116,6 +119,10 @@ caclient_create
 #if ENABLE_CAPMT
   if (c == &caclient_capmt_class)
     cac = capmt_create();
+#endif
+#if ENABLE_CAPMT2
+  if (c == &caclient_capmt2_class)
+    cac = capmt2_create();
 #endif
 #if ENABLE_CONSTCW
   if (c == &caclient_ccw_csa_cbc_class ||

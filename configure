@@ -23,6 +23,7 @@ OPTIONS=(
   "cwc:yes"
   "cccam:yes"
   "capmt:yes"
+  "capmt2:yes"
   "constcw:yes"
   "linuxdvb:yes"
   "satip_server:yes"
@@ -770,7 +771,7 @@ fi
 # libdvbcsa, tvhcsa
 #
 if enabled_or_auto tvhcsa; then
-  if enabled cwc || enabled cccam || enabled capmt || enabled constcw; then
+  if enabled cwc || enabled cccam || enabled capmt || enabled capmt2 || enabled constcw; then
     enable tvhcsa
     enable dvbcsa
     if enabled dvbcsa; then

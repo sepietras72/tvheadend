@@ -111,10 +111,35 @@ tvh_extradata_open(TVHContext *self, AVDictionary **opts)
 
 
 /* H264 */
+
+/*
+ * nowosc: be more tolerant of a briefly corrupted H264 bitstream - e.g. the
+ * handful of TS packets that can be decrypted with a stale/incoming key
+ * right around a DVB control-word parity switch. By default libavcodec's
+ * h264 decoder can go quiet (withhold output) for the rest of the current
+ * GOP once its reference picture chain is broken, which on a long-GOP
+ * broadcast (common on sports muxes) shows up as a multi-second freeze
+ * until the next IDR frame. Telling it to ignore bitstream errors and show
+ * whatever it can decode trades that hard freeze for a brief, much shorter
+ * glitch instead.
+ */
+static int
+tvh_h264_decoder_open(TVHContext *self, AVDictionary **opts)
+{
+    int ret;
+
+    if ((ret = tvh_extradata_open(self, opts))) {
+        return ret;
+    }
+    self->iavctx->err_recognition = AV_EF_IGNORE_ERR;
+    self->iavctx->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
+    return 0;
+}
+
 static TVHContextHelper TVHH264Decoder = {
     .type = AVMEDIA_TYPE_VIDEO,
     .id   = AV_CODEC_ID_H264,
-    .open = tvh_extradata_open,
+    .open = tvh_h264_decoder_open,
 };
 
 /* THEORA */

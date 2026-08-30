@@ -19,13 +19,13 @@
 
 
 #include "transcoding/codec/internals.h"
+#include <string.h>
 
 /* libsvtav1 =================================================================== */
 
 typedef struct {
     TVHVideoCodecProfile;
     int preset;
-    int cpu_used;
     int tune;
     char *params;
 } tvh_codec_profile_libsvtav1_t;
