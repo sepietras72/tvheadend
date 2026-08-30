@@ -223,8 +223,17 @@ descrambler_data_analyze(th_descrambler_runtime_t *dr,
   int packets = 0, blocks = 0;
 
   for (dd2 = TAILQ_NEXT(dd, dd_link); dd2; dd2 = TAILQ_NEXT(dd2, dd_link)) {
-    tsb0 = dd->dd_sbuf.sb_data;
-    if (tsb0 == NULL || dd->dd_sbuf.sb_ptr == 0) continue;
+    /*
+     * bugfix: bylo "dd->dd_sbuf...." (stary, niezmieniajacy sie wskaznik
+     * przekazany do funkcji) zamiast "dd2->dd_sbuf...." (biezacy element
+     * petli). W praktyce funkcja sprawdzala od nowa wciaz ten sam,
+     * pierwszy bajt zamiast bajtu KAZDEGO kolejnego bloku - warunek byl
+     * wiec stale prawdziwy lub stale falszywy przez cala petle, przez co
+     * "paritycheck" nie weryfikowal realnie ciaglosci nowej parzystosci
+     * w kolejnych blokach, tylko liczyl bajty bez faktycznej kontroli.
+     */
+    tsb0 = dd2->dd_sbuf.sb_data;
+    if (tsb0 == NULL || dd2->dd_sbuf.sb_ptr == 0) continue;
     if ((tsb0[3] & 0x80) != 0 && (tsb0[3] & 0x40) == (ki & 0x40)) {
       packets += dd2->dd_sbuf.sb_ptr;
       if (packets >= dr->dr_paritycheck)
