@@ -22,7 +22,9 @@
     "             'inverted' - ECM 0x81 means even, ECM 0x80 means odd",
     "standby_age - (custom) max age in milliseconds of a cached standby key",
     "              from another, non-active CA client, before a fast failover",
-    "              (skipping a full ECM reset) may use it. Default 8000."
+    "              (skipping a full ECM reset) may use it. Defaults to",
+    "              'interval' if unset - a standby key is only ever as fresh",
+    "              as the ECM interval itself allows."
   ],
   "caid": [
     {

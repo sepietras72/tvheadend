@@ -43,19 +43,25 @@
 #define ECM_PARITY_81EVEN_80ODD         2
 
 /*
- * nowosc: domyslny maksymalny wiek (w ms) zcache'owanego klucza "zapasowego"
- * od innego klienta CA, ponizej ktorego ecm_reset() moze go uzyc od razu
+ * nowosc: maksymalny wiek (w ms) zcache'owanego klucza "zapasowego" od
+ * innego klienta CA, ponizej ktorego ecm_reset() moze go uzyc od razu
  * zamiast pelnego resetu. Konfigurowalne per-CAID w pliku "descrambler"
  * (pole "standby_age", w milisekundach) - patrz descrambler_load_hints().
+ *
+ * bugfix: byl tu wczesniej maly, staly domyslny prog (5000, potem 8000ms).
+ * To bylo strukturalnie zle dobrane - klucz zapasowy odswieza sie NAJWYZEJ
+ * raz na "interval" (dostaje go tak samo rzadko jak klucz aktywny, przy
+ * okazji tego samego ECM), a potrzebny jest dopiero tuz PRZED kolejna
+ * rotacja CW, czyli realnie ma wtedy wiek bliski calego "interval".
+ * Przy typowych interval >= 10-20s maly staly prog gwarantowal, ze zapas
+ * zawsze zdazy "wygasnac" (patrz warunek nizej w ecm_reset()), zanim w
+ * ogole dojdzie do awarii aktywnego klienta - failover nigdy nie mial
+ * z czego skorzystac i zawsze spadal do pelnego resetu ECM (dlugie
+ * wiszenie obrazu). 0 tutaj = "nie ustawiono jawnie", patrz uzycie w
+ * descrambler_load_hints()/descrambler_service_start() - domyslnie
+ * rownamy standby_age do "interval".
  */
-/*
- * nowosc: podniesione z 5000 na 8000 - w praktyce (patrz test na tym
- * serwerze) wolniejszy sieciowy klient CA potrafi odpowiadac z
- * opoznieniem tuz ponad 5s (widziane: "Req delay: 5022 ms"), wiec
- * przy starym progu jego swiezo zcache'owany klucz zapasowy czesto
- * wygasal, zanim w ogole doszlo do awarii glownego klienta.
- */
-#define ECM_STANDBY_AGE_DEFAULT         8000
+#define ECM_STANDBY_AGE_DEFAULT         0
 
 typedef struct th_descrambler_data {
   TAILQ_ENTRY(th_descrambler_data) dd_link;
@@ -328,6 +334,7 @@ descrambler_load_hints(htsmsg_t *m)
   htsmsg_t *e;
   htsmsg_field_t *f;
   const char *s;
+  char sabuf[24];
 
   HTSMSG_FOREACH(f, m) {
     if (!(e = htsmsg_field_get_map(f))) continue;
@@ -344,7 +351,11 @@ descrambler_load_hints(htsmsg_t *m)
     hint.dh_paritycheck = htsmsg_get_s32_or_default(e, "paritycheck", 20);
     hint.dh_ecmparity = str2val_def(htsmsg_get_str(e, "ecmparity"), ecmparitytab, ECM_PARITY_DEFAULT);
     hint.dh_standby_age = htsmsg_get_s32_or_default(e, "standby_age", ECM_STANDBY_AGE_DEFAULT);
-    tvhinfo(LS_DESCRAMBLER, "adding CAID %04X/%04X as%s%s%s interval %ums pc %d ep %s sa %ums (%s)",
+    if (hint.dh_standby_age)
+      snprintf(sabuf, sizeof(sabuf), "%ums", hint.dh_standby_age);
+    else
+      snprintf(sabuf, sizeof(sabuf), "auto(=interval)");
+    tvhinfo(LS_DESCRAMBLER, "adding CAID %04X/%04X as%s%s%s interval %ums pc %d ep %s sa %s (%s)",
                             hint.dh_caid, hint.dh_mask,
                             hint.dh_constcw ? " ConstCW" : "",
                             hint.dh_quickecm ? " QuickECM" : "",
@@ -352,7 +363,7 @@ descrambler_load_hints(htsmsg_t *m)
                             hint.dh_interval,
                             hint.dh_paritycheck,
                             val2str(hint.dh_ecmparity, ecmparitytab),
-                            hint.dh_standby_age,
+                            sabuf,
                             htsmsg_get_str(e, "name") ?: "unknown");
     dhint = malloc(sizeof(*dhint));
     *dhint = hint;
@@ -476,6 +487,16 @@ descrambler_service_start ( service_t *t )
     }
 
   }
+
+  /*
+   * bugfix: brak jawnego standby_age per-CAID -> domyslnie rownamy go do
+   * "interval" (patrz komentarz przy ECM_STANDBY_AGE_DEFAULT) zamiast
+   * malego, stalego progu w sekundach - inaczej klucz zapasowy prawie
+   * zawsze byl juz "za stary" w momencie, gdy failover faktycznie go
+   * potrzebowal.
+   */
+  if (!standby_age)
+    standby_age = interval;
 
   tvh_mutex_lock(&t->s_stream_mutex);
   ((mpegts_service_t *)t)->s_dvb_mux->mm_descrambler_flush = 0;
