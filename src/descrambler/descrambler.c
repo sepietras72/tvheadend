@@ -614,7 +614,7 @@ descrambler_notify( th_descrambler_t *td,
   di->hops    = hops;
   strlcpy(di->cardsystem, cardsystem, sizeof(di->cardsystem));
   strlcpy(di->reader, reader, sizeof(di->reader));
-  strlcpy(di->from, from, sizeof(di->protocol));
+  strlcpy(di->from, from, sizeof(di->from));
   strlcpy(di->protocol, protocol, sizeof(di->protocol));
 
   tvh_mutex_lock(&t->s_stream_mutex);
@@ -1055,6 +1055,9 @@ ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
   th_descrambler_key_t *tk;
   int ret = 0, i;
   int64_t now = mclk();
+  uint8_t standby_even[16], standby_odd[16];
+  uint8_t standby_valid = 0, standby_type = 0;
+  uint16_t standby_pid = 0;
 
   /*
    * nowosc: zanim wymusimy pelny reset (czyli nowy round-trip ECM na
@@ -1064,7 +1067,16 @@ ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
    * przelacz sie na niego od razu, bez czekania na kolejna wymiane ECM.
    * To realny "hot standby" failover miedzy niezaleznymi zrodlami CA
    * (np. dvbapi + CCcam do innego serwera).
+   *
+   * bugfix: td_standby_* jest zapisywane pod t->s_stream_mutex w
+   * descrambler_keys(), wiec czytamy/kasujemy je tutaj pod tym samym
+   * lockiem, zeby uniknac wyscigu (mozliwy odczyt rozdartego klucza,
+   * gdy inny watek klienta CA akurat zapisuje standby w tym samym
+   * momencie). Kopiujemy dane do lokalnych zmiennych i zwalniamy lock
+   * PRZED wywolaniem td_ecm_reset()/descrambler_keys() nizej - te
+   * moga same wewnetrznie chciec zablokowac ten sam mutex.
    */
+  tvh_mutex_lock(&t->s_stream_mutex);
   LIST_FOREACH(td, &t->s_descramblers, td_service_link) {
     if (td->td_keystate == DS_RESOLVED)
       continue;
@@ -1077,6 +1089,17 @@ ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
     promote = td;
     break;
   }
+  if (promote) {
+    standby_valid = promote->td_standby_valid;
+    standby_type  = promote->td_standby_type;
+    standby_pid   = promote->td_standby_pid;
+    if (standby_valid & 1)
+      memcpy(standby_even, promote->td_standby_even, sizeof(standby_even));
+    if (standby_valid & 2)
+      memcpy(standby_odd, promote->td_standby_odd, sizeof(standby_odd));
+    promote->td_standby_valid = 0;
+  }
+  tvh_mutex_unlock(&t->s_stream_mutex);
 
   if (promote) {
     tvhinfo(LS_DESCRAMBLER,
@@ -1085,12 +1108,9 @@ ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
     LIST_FOREACH(td, &t->s_descramblers, td_service_link)
       if (td != promote && td->td_keystate == DS_RESOLVED)
         td->td_ecm_reset(td);
-    descrambler_keys(promote,
-                      promote->td_standby_type,
-                      promote->td_standby_pid,
-                      (promote->td_standby_valid & 1) ? promote->td_standby_even : NULL,
-                      (promote->td_standby_valid & 2) ? promote->td_standby_odd  : NULL);
-    promote->td_standby_valid = 0;
+    descrambler_keys(promote, standby_type, standby_pid,
+                      (standby_valid & 1) ? standby_even : NULL,
+                      (standby_valid & 2) ? standby_odd  : NULL);
     return 1;
   }
 

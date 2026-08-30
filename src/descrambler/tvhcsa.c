@@ -244,6 +244,7 @@ void tvhcsa_set_key_even( tvhcsa_t *csa, const uint8_t *even )
   case DESCRAMBLER_AES128_ECB:
     aes128_set_even_control_word(csa->csa_priv, even);
     break;
+  default:
     assert(0);
   }
 }
