@@ -45,6 +45,24 @@ libav_log_callback(void *ptr, int level, const char *fmt, va_list vl)
     } else if (strcmp(class_name, "AVCodecContext") == 0) {
       if (strcmp(fmt, "forced frame type (%d) at %d was changed to frame type (%d)\n") == 0) {
         level = AV_LOG_TRACE;
+      } else if (strcmp(fmt, "non-existing PPS %u referenced\n") == 0 ||
+                 strcmp(fmt, "no frame!\n") == 0 ||
+                 strcmp(fmt, "mmco: unref short failure\n") == 0 ||
+                 strcmp(fmt, "reference picture missing during reorder\n") == 0 ||
+                 strcmp(fmt, "Missing reference picture, default is %d\n") == 0 ||
+                 strcmp(fmt, "number of reference frames (%d+%d) exceeds max (%d; probably "
+                             "corrupt input), discarding one\n") == 0) {
+        /*
+         * nowosc: to sa oczekiwane skutki uboczne wlasnego patcha
+         * tvh_h264_decoder_open() (AV_EF_IGNORE_ERR + SHOW_ALL) w
+         * transcode/helpers.c - dekoder H264 celowo probuje wyciagnac
+         * cokolwiek z chwilowo uszkodzonego bitstreamu (np. w oknie
+         * zmiany klucza CW) zamiast zamrozic obraz do nastepnego IDR.
+         * Bez tego te komunikaty zalewaja log dziesiatkami linii w tej
+         * samej milisekundzie akurat wtedy, gdy system i tak odzyskuje
+         * po uszkodzonym GOP-ie.
+         */
+        level = AV_LOG_TRACE;
       }
     }
 
