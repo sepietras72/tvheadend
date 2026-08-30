@@ -207,6 +207,21 @@ void descrambler_service_start ( struct service *t );
 void descrambler_service_stop  ( struct service *t );
 void descrambler_caid_changed  ( struct service *t );
 int  descrambler_resolved      ( struct service *t, th_descrambler_t *ignore );
+/*
+ * nowosc: probuje natychmiast promowac zcache'owany klucz zapasowy od
+ * innego, nie-aktywnego klienta CA dla tej uslugi (patrz td_standby_*
+ * w th_descrambler_t) zamiast czekac na kolejna pelna wymiane ECM.
+ * Uzywane zarowno przez ecm_reset() (klucz aktywnego klienta sie
+ * spoznil), jak i przez klientow CA (cclient.c) w momencie, gdy
+ * aktywny (DS_RESOLVED) klient dostaje "access denied" dla wlasnego
+ * ECM i demontuje sie na DS_FORBIDDEN - ta druga sciezka nigdy nie
+ * przechodzi przez ecm_reset(), wiec bez jawnego wywolania tutaj fast
+ * failover nie mialby tam szansy zadzialac. Zwraca 1, jesli promocja
+ * sie powiodla (jakis td dostal nowy, aktywny klucz), 0 w przeciwnym
+ * razie (brak waznego cache'u - wywolujacy powinien wtedy wymusic
+ * normalny, pelny reset ECM).
+ */
+int  descrambler_standby_promote( struct service *t, th_descrambler_runtime_t *dr );
 int  descrambler_multi_pid     ( th_descrambler_t *t );
 void descrambler_keys          ( th_descrambler_t *t, int type, uint16_t pid,
                                  const uint8_t *even, const uint8_t *odd );

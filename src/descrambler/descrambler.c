@@ -1076,26 +1076,27 @@ key_find_struct( th_descrambler_runtime_t *dr,
   return NULL;
 }
 
-static int
-ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
+/*
+ * nowosc: wydzielone z ecm_reset() do osobnej, publicznej funkcji - ta sama
+ * logika promocji cache'owanego klucza zapasowego jest teraz potrzebna
+ * takze poza "klucz sie spoznil" (key_late() w descrambler_descramble()).
+ * Konkretnie: gdy AKTUALNIE AKTYWNY (DS_RESOLVED) klient CA sam dostaje
+ * "access denied" (NOK) dla wlasnego, kolejnego ECM, cclient.c demontuje
+ * go bezposrednio na DS_FORBIDDEN - z pominieciem ecm_reset() w ogole.
+ * Bez tego wywolania fast failover nigdy nie mial szansy zadzialac w tym
+ * scenariuszu (patrz wywolanie w cc_ecm_reply() w cclient.c), mimo ze
+ * inny reader mogl miec w tym momencie idealnie swiezy cache standby.
+ */
+int
+descrambler_standby_promote( service_t *t, th_descrambler_runtime_t *dr )
 {
   th_descrambler_t *td, *promote = NULL;
-  th_descrambler_key_t *tk;
-  int ret = 0, i;
   int64_t now = mclk();
   uint8_t standby_even[16], standby_odd[16];
   uint8_t standby_valid = 0, standby_type = 0;
   uint16_t standby_pid = 0;
 
   /*
-   * nowosc: zanim wymusimy pelny reset (czyli nowy round-trip ECM na
-   * WSZYSTKICH klientach), sprawdz czy inny, aktualnie nie-aktywny klient
-   * CA nie ma juz swiezo zcache'owanego klucza zapasowego - odrzuconego
-   * wczesniej tylko dlatego, ze inny klient byl DS_RESOLVED. Jesli tak,
-   * przelacz sie na niego od razu, bez czekania na kolejna wymiane ECM.
-   * To realny "hot standby" failover miedzy niezaleznymi zrodlami CA
-   * (np. dvbapi + CCcam do innego serwera).
-   *
    * bugfix: td_standby_* jest zapisywane pod t->s_stream_mutex w
    * descrambler_keys(), wiec czytamy/kasujemy je tutaj pod tym samym
    * lockiem, zeby uniknac wyscigu (mozliwy odczyt rozdartego klucza,
@@ -1112,11 +1113,11 @@ ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
    * standby_age.
    */
   tvhtrace(LS_DESCRAMBLER,
-           "ecm_reset: service \"%s\" standby_age=%ldms, scanning descramblers",
+           "standby_promote: service \"%s\" standby_age=%ldms, scanning descramblers",
            t->s_nicename, (long)(dr->dr_ecm_standby_age / 1000));
   LIST_FOREACH(td, &t->s_descramblers, td_service_link) {
     tvhtrace(LS_DESCRAMBLER,
-             "ecm_reset:   %s keystate=%s standby_valid=%d age=%ldms",
+             "standby_promote:   %s keystate=%s standby_valid=%d age=%ldms",
              td->td_nicename, descrambler_keystate2str(td->td_keystate),
              td->td_standby_valid,
              (long)(td->td_standby_valid ? (now - td->td_standby_time) / 1000 : -1));
@@ -1125,7 +1126,7 @@ ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
     if (!td->td_standby_valid)
       continue;
     if (td->td_standby_time + dr->dr_ecm_standby_age < now) {
-      tvhtrace(LS_DESCRAMBLER, "ecm_reset:   %s standby too old, discarding",
+      tvhtrace(LS_DESCRAMBLER, "standby_promote:   %s standby too old, discarding",
                td->td_nicename);
       td->td_standby_valid = 0; /* zbyt stary - odrzuc */
       continue;
@@ -1145,18 +1146,30 @@ ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
   }
   tvh_mutex_unlock(&t->s_stream_mutex);
 
-  if (promote) {
-    tvhinfo(LS_DESCRAMBLER,
-            "%s: fast failover - using cached standby key for service \"%s\" "
-            "instead of full ECM reset", promote->td_nicename, t->s_nicename);
-    LIST_FOREACH(td, &t->s_descramblers, td_service_link)
-      if (td != promote && td->td_keystate == DS_RESOLVED)
-        td->td_ecm_reset(td);
-    descrambler_keys(promote, standby_type, standby_pid,
-                      (standby_valid & 1) ? standby_even : NULL,
-                      (standby_valid & 2) ? standby_odd  : NULL);
+  if (!promote)
+    return 0;
+
+  tvhinfo(LS_DESCRAMBLER,
+          "%s: fast failover - using cached standby key for service \"%s\" "
+          "instead of full ECM reset", promote->td_nicename, t->s_nicename);
+  LIST_FOREACH(td, &t->s_descramblers, td_service_link)
+    if (td != promote && td->td_keystate == DS_RESOLVED)
+      td->td_ecm_reset(td);
+  descrambler_keys(promote, standby_type, standby_pid,
+                    (standby_valid & 1) ? standby_even : NULL,
+                    (standby_valid & 2) ? standby_odd  : NULL);
+  return 1;
+}
+
+static int
+ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
+{
+  th_descrambler_t *td;
+  th_descrambler_key_t *tk;
+  int ret = 0, i;
+
+  if (descrambler_standby_promote(t, dr))
     return 1;
-  }
 
   /* reset the reader ECM state */
   LIST_FOREACH(td, &t->s_descramblers, td_service_link) {

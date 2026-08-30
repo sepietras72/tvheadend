@@ -488,6 +488,17 @@ forbid:
       if (t->s_dvb_prefcapid == ct->cs_capid &&
           t->s_dvb_prefcapid_lock == PREFCAPID_OFF)
         t->s_dvb_prefcapid = 0;
+      /*
+       * nowosc: ta demotywacja ("access denied" na WLASNYM ECM aktywnego
+       * klienta) nigdy nie przechodzi przez ecm_reset() w descrambler.c,
+       * wiec bez jawnego wywolania tutaj fast failover nie mialby tu
+       * szansy zadzialac - obraz wisialby na "brak dostepu" az do
+       * kolejnej, przypadkowej pelnej wymiany ECM od innego klienta.
+       * Sprobuj wiec natychmiast promowac zcache'owany klucz zapasowy
+       * od innego, juz gotowego (choc na razie nieaktywnego) klienta CA.
+       */
+      if (((service_t *)t)->s_descramble)
+        descrambler_standby_promote((service_t *)t, ((service_t *)t)->s_descramble);
     }
     return;
 
