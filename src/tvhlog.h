@@ -164,6 +164,7 @@ enum {
   LS_CACLIENT,
   LS_CSA,
   LS_CAPMT,
+  LS_CAPMT2,
   LS_CWC,
   LS_CCCAM,
   LS_DVBCAM,
@@ -222,10 +223,12 @@ enum {
     LST_VORBIS,
     LST_MPEG2VIDEO,
     LST_LIBVPX,
+    LST_LIBSVTAV1,
     LST_LIBX26X,
     LST_NVENC,
-    LST_OMX,
+    LST_V4l2M2M,
     LST_VAAPI,
+    LST_QSV,
     LST_VAINFO,
     LST_LAST     /* keep this last */
 };

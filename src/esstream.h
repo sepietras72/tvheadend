@@ -22,6 +22,9 @@
 
 #include "descrambler/descrambler.h"
 #include "input/mpegts/dvb.h"
+#if ENABLE_LIBAV
+#include <libavutil/rational.h>
+#endif
 
 /**
  *
@@ -62,6 +65,7 @@ enum streaming_component_type {
   SCT_VORBIS,
   SCT_HEVC,
   SCT_VP9,
+  SCT_AV1,
   SCT_THEORA,
   SCT_OPUS,
   SCT_FLAC,
@@ -73,7 +77,7 @@ enum streaming_component_type {
 
 #define SCT_ISVIDEO(t) ((t) == SCT_MPEG2VIDEO || (t) == SCT_H264 || \
 			(t) == SCT_VP8 || (t) == SCT_HEVC || \
-			(t) == SCT_VP9 || (t) == SCT_THEORA)
+			(t) == SCT_VP9 || (t) == SCT_THEORA || (t) == SCT_AV1)
 
 #define SCT_ISAUDIO(t) ((t) == SCT_MPEG2AUDIO || (t) == SCT_AC3 || \
 			(t) == SCT_AAC  || (t) == SCT_MP4A || \
@@ -93,13 +97,23 @@ struct elementary_info {
   int16_t es_pid;
   int es_type;
 
-  int es_frame_duration;
+  int64_t es_frame_duration;
 
+  // temporary used for each field
+  int es_width_2b;
+  int es_height_2b;
+  int es_width_12b;
+  int es_height_12b;
+
+  // store the final width,height (after 2bits+12bits concatenation)
   int es_width;
   int es_height;
 
   uint16_t es_aspect_num;
   uint16_t es_aspect_den;
+#if ENABLE_LIBAV
+  AVRational es_sample_aspect_ratio;
+#endif
 
   char es_lang[4];           /* ISO 639 2B 3-letter language code */
   uint8_t es_audio_type;     /* Audio type */

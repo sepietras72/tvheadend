@@ -23,6 +23,7 @@ OPTIONS=(
   "cwc:yes"
   "cccam:yes"
   "capmt:yes"
+  "capmt2:yes"
   "constcw:yes"
   "linuxdvb:yes"
   "satip_server:yes"
@@ -45,6 +46,8 @@ OPTIONS=(
   "libx264_static:yes"
   "libx265:yes"
   "libx265_static:yes"
+  "libsvtav1:no"
+  "libsvtav1_static:no"
   "libvpx:yes"
   "libvpx_static:yes"
   "libtheora:yes"
@@ -57,8 +60,9 @@ OPTIONS=(
   "libopus_static:yes"
   "nvenc:no"
   "vaapi:auto"
+  "qsv:no"
   "mmal:no"
-  "omx:no"
+  "v4l2m2m:no"
   "inotify:auto"
   "epoll:auto"
   "pcre:auto"
@@ -617,6 +621,16 @@ if enabled ffmpeg_static; then
     disable libx265_static
   fi
 
+  # libsvtav1
+  if enabled libsvtav1; then
+  if disabled libsvtav1_static; then
+      check_pkg SvtAv1Enc ">=1.0" || die "SvtAv1Enc package not found"
+    else
+      check_bin cmake || die "cmake not found"
+      check_cc_lib stdc++ stdcpp || die "libstdc++ not found"
+    fi
+  fi
+
   # libvpx
   if enabled libvpx; then
     if disabled libvpx_static; then
@@ -679,22 +693,6 @@ if enabled ffmpeg_static; then
     enable hwaccels
   else
     disable nvenc
-  fi
-
-  # omx
-  if enabled omx; then
-    OLDCFLAGS=$CFLAGS
-    if [ -d "/opt/vc/include" ]; then
-      CFLAGS="-I/opt/vc/include $CFLAGS"
-    fi
-    check_cc_header "bcm_host" omx_rpi
-    if enabled omx_rpi; then
-      CFLAGS="-I/opt/vc/include/IL $OLDCFLAGS"
-      enable mmal
-    else
-      CFLAGS=$OLDCFLAGS
-    fi
-    check_cc_header OMX_Core omx || die "OpenMAX IL not found"
   fi
 
 else
@@ -779,6 +777,26 @@ if enabled_or_auto vaapi; then
 fi
 
 #
+# qsv
+#
+if enabled_or_auto qsv; then
+  if check_pkg libmfx ">=1.28"; then
+    enable qsv
+    enable hwaccels
+  elif enable qsv; then
+    die "Intel MediaSDK (AKA Quick Sync Video) not found"
+  fi
+fi
+
+#
+# v4l2
+#
+if enabled v4l2m2m; then
+  check_pkg libv4l2 ">=1.22" || die "libv4l2 1.22 package not found"
+  enable hwaccels
+fi
+
+#
 # Inotify
 #
 if enabled_or_auto inotify; then
@@ -808,7 +826,7 @@ fi
 # libdvbcsa, tvhcsa
 #
 if enabled_or_auto tvhcsa; then
-  if enabled cwc || enabled cccam || enabled capmt || enabled constcw; then
+  if enabled cwc || enabled cccam || enabled capmt || enabled capmt2 || enabled constcw; then
     enable tvhcsa
     enable dvbcsa
     if enabled dvbcsa; then

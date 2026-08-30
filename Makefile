@@ -129,6 +129,10 @@ ifeq ($(CONFIG_LIBX265_STATIC),yes)
 FFMPEG_DEPS += libx265
 endif
 
+ifeq ($(CONFIG_LIBSVTAV1_STATIC),yes)
+FFMPEG_DEPS += libsvtav1
+endif
+
 ifeq ($(CONFIG_LIBVPX_STATIC),yes)
 FFMPEG_DEPS += libvpx
 endif
@@ -517,6 +521,9 @@ SRCS-CODECS += $(wildcard src/transcoding/codec/codecs/*.c)
 ifneq (,$(filter yes,$(CONFIG_LIBX264) $(CONFIG_LIBX265)))
 LIBS-CODECS += libx26x
 endif
+ifeq ($(CONFIG_LIBSVTAV1),yes)
+LIBS-CODECS += libsvtav1
+endif
 ifeq ($(CONFIG_LIBVPX),yes)
 LIBS-CODECS += libvpx
 endif
@@ -535,19 +542,37 @@ endif
 ifeq ($(CONFIG_VAAPI),yes)
 LIBS-CODECS += vaapi
 endif
+ifeq ($(CONFIG_QSV),yes)
+LIBS-CODECS += qsv
+endif
 ifeq ($(CONFIG_NVENC),yes)
 LIBS-CODECS += nvenc
 endif
-ifeq ($(CONFIG_OMX),yes)
-LIBS-CODECS += omx
+ifeq ($(CONFIG_V4L2M2M),yes)
+LIBS-CODECS += v4l2-m2m
 endif
 SRCS-CODECS += $(foreach lib,$(LIBS-CODECS),src/transcoding/codec/codecs/libs/$(lib).c)
+# shared DRM device enumeration, used by the VAAPI and QSV profile classes
+ifeq ($(CONFIG_VAAPI),yes)
+SRCS-CODECS += src/transcoding/codec/codecs/libs/drmdev.c
+else ifeq ($(CONFIG_QSV),yes)
+SRCS-CODECS += src/transcoding/codec/codecs/libs/drmdev.c
+endif
 
 #hwaccels
 ifeq ($(CONFIG_HWACCELS),yes)
 SRCS-HWACCELS += src/transcoding/transcode/hwaccels/hwaccels.c
+ifeq ($(CONFIG_NVENC),yes)
+SRCS-HWACCELS += src/transcoding/transcode/hwaccels/nv.c
+endif
 ifeq ($(CONFIG_VAAPI),yes)
 SRCS-HWACCELS += src/transcoding/transcode/hwaccels/vaapi.c
+endif
+ifeq ($(CONFIG_QSV),yes)
+SRCS-HWACCELS += src/transcoding/transcode/hwaccels/qsv.c
+endif
+ifeq ($(CONFIG_V4L2M2M),yes)
+SRCS-HWACCELS += src/transcoding/transcode/hwaccels/v4l2-m2m.c
 endif
 endif
 
@@ -599,6 +624,12 @@ SRCS-CAPMT = \
 	src/descrambler/capmt.c
 SRCS-${CONFIG_CAPMT} += $(SRCS-CAPMT)
 I18N-C += $(SRCS-CAPMT)
+
+# CAPMT2
+SRCS-CAPMT2 = \
+	src/descrambler/capmt2.c
+SRCS-${CONFIG_CAPMT2} += $(SRCS-CAPMT2)
+I18N-C += $(SRCS-CAPMT2)
 
 # CONSTCW
 SRCS-CONSTCW = \

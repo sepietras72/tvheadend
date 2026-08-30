@@ -89,6 +89,8 @@
  * Define used when calling functions for VP9 low power
  */
 #define VAINFO_VP9_LOW_POWER        8
+#define VAINFO_AV1                  9
+#define VAINFO_AV1_LOW_POWER        10
 
 /**
  * VAINFO initialize.

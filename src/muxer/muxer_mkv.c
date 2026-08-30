@@ -283,8 +283,10 @@ mk_build_tracks(mk_muxer_t *mk, streaming_start_t *ss)
     tr->sri = ssc->es_sri;
     tr->nextpts = PTS_UNSET;
 
-    if (mk->webm && ssc->es_type != SCT_VP8 && ssc->es_type != SCT_VORBIS)
-      tvhwarn(LS_MKV, "WEBM format supports only VP8+VORBIS streams (detected %s)",
+    if (mk->webm &&
+        ssc->es_type != SCT_VP8 && ssc->es_type != SCT_VP9 &&
+        ssc->es_type != SCT_VORBIS && ssc->es_type != SCT_OPUS)
+      tvhwarn(LS_MKV, "WEBM format supports only VP8/VP9 video and Vorbis/Opus audio (detected %s)",
               streaming_component_type2txt(ssc->es_type));
 
     switch(ssc->es_type) {
@@ -316,6 +318,11 @@ mk_build_tracks(mk_muxer_t *mk, streaming_start_t *ss)
     case SCT_VP9:
       tracktype = 1;
       codec_id = "V_VP9";
+      mk->cluster_maxsize = 10000000;
+      break;
+    case SCT_AV1:
+      tracktype = 1;
+      codec_id = "V_AV1";
       mk->cluster_maxsize = 10000000;
       break;
 

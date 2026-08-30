@@ -31,6 +31,7 @@ extern const idclass_t caclient_cc_class;
 extern const idclass_t caclient_cwc_class;
 extern const idclass_t caclient_cccam_class;
 extern const idclass_t caclient_capmt_class;
+extern const idclass_t caclient_capmt2_class;
 extern const idclass_t caclient_ccw_csa_cbc_class;
 extern const idclass_t caclient_ccw_des_ncb_class;
 extern const idclass_t caclient_ccw_aes_ecb_class;
@@ -99,6 +100,7 @@ caclient_t *dvbcam_create(void);
 caclient_t *cwc_create(void);
 caclient_t *cccam_create(void);
 caclient_t *capmt_create(void);
+caclient_t *capmt2_create(void);
 caclient_t *constcw_create(void);
 caclient_t *tsdebugcw_create(void);
 

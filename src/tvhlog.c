@@ -145,6 +145,7 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
   [LS_CACLIENT]      = { "caclient",      N_("CA (descrambling) Client") },
   [LS_CSA]           = { "csa",           N_("CSA (descrambling)") },
   [LS_CAPMT]         = { "capmt",         N_("CAPMT CA Client") },
+  [LS_CAPMT2]        = { "capmt2",        N_("CAPMT2 CA Client (OSCam, incremental)") },
   [LS_CWC]           = { "cwc",           N_("CWC CA Client") },
   [LS_CCCAM]         = { "cccam",         N_("CWC CCCam Client") },
   [LS_DVBCAM]        = { "dvbcam",        N_("DVB CAM Client") },
@@ -207,10 +208,12 @@ tvhlog_subsys_t tvhlog_transcode_subsystems[] = {
     [LST_VORBIS]        = { "vorbis",        N_("VORBIS") },
     [LST_MPEG2VIDEO]    = { "mpeg2video",    N_("MPEG2 VIDEO") },
     [LST_LIBVPX]        = { "libvpx",        N_("LIB VPX") },
+    [LST_LIBSVTAV1]     = { "libsvtav1",     N_("LIB SVTAV1") },
     [LST_LIBX26X]       = { "libx26x",       N_("LIB x264_x265") },
     [LST_NVENC]         = { "nvenc",         N_("NVENC") },
-    [LST_OMX]           = { "omx",           N_("OMX") },
+    [LST_V4l2M2M]       = { "v4l2",          N_("V4L2-API") },
     [LST_VAAPI]         = { "vaapi",         N_("VA-API") },
+    [LST_QSV]           = { "qsv",           N_("QSV-API") },
     [LST_VAINFO]        = { "vainfo",        N_("VAINFO") },
 };
 
