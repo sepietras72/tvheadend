@@ -69,6 +69,21 @@ typedef struct th_descrambler {
   int  (*td_ecm_reset)  (struct th_descrambler *d);
   void (*td_ecm_idle)   (struct th_descrambler *d);
 
+  /*
+   * nowosc: "zapasowy" klucz od tego klienta, zcache'owany w momencie gdy
+   * jego odpowiedz zostala zignorowana tylko dlatego, ze inny klient CA byl
+   * juz DS_RESOLVED dla tej samej uslugi (patrz descrambler_keys()). Dzieki
+   * temu przy ecm_reset() (klucz od aktywnego klienta sie spoznil) mozna
+   * natychmiast przelaczyc sie na juz gotowy klucz od innego klienta, bez
+   * czekania na kolejna, pelna wymiane ECM od zera - patrz ecm_reset().
+   */
+  uint8_t  td_standby_even[16];
+  uint8_t  td_standby_odd[16];
+  uint16_t td_standby_pid;
+  uint8_t  td_standby_type;
+  uint8_t  td_standby_valid;   /* bit0=even valid, bit1=odd valid */
+  int64_t  td_standby_time;    /* mclk() w momencie zapisania cache */
+
 } th_descrambler_t;
 
 typedef struct th_descrambler_key {
@@ -103,6 +118,7 @@ typedef struct th_descrambler_runtime {
   int64_t  dr_ecm_start[2];
   int64_t  dr_ecm_last_key_time;
   int64_t  dr_ecm_key_margin;
+  int64_t  dr_ecm_standby_age; /* nowosc: patrz ecm_reset(), konfigurowalne per-CAID */
   int64_t  dr_last_err;
   int64_t  dr_force_skip;
   th_descrambler_key_t dr_keys[DESCRAMBLER_MAX_KEYS];

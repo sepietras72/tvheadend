@@ -19,7 +19,10 @@
     "              in the input TS stream",
     "ecmparity - can be a string from this list:",
     "             'standard' - ECM 0x80 means even, ECM 0x81 means odd",
-    "             'inverted' - ECM 0x81 means even, ECM 0x80 means odd"
+    "             'inverted' - ECM 0x81 means even, ECM 0x80 means odd",
+    "standby_age - (custom) max age in milliseconds of a cached standby key",
+    "              from another, non-active CA client, before a fast failover",
+    "              (skipping a full ECM reset) may use it. Default 5000."
   ],
   "caid": [
     {

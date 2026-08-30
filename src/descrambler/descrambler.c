@@ -42,6 +42,14 @@
 #define ECM_PARITY_80EVEN_81ODD		1
 #define ECM_PARITY_81EVEN_80ODD         2
 
+/*
+ * nowosc: domyslny maksymalny wiek (w ms) zcache'owanego klucza "zapasowego"
+ * od innego klienta CA, ponizej ktorego ecm_reset() moze go uzyc od razu
+ * zamiast pelnego resetu. Konfigurowalne per-CAID w pliku "descrambler"
+ * (pole "standby_age", w milisekundach) - patrz descrambler_load_hints().
+ */
+#define ECM_STANDBY_AGE_DEFAULT         5000
+
 typedef struct th_descrambler_data {
   TAILQ_ENTRY(th_descrambler_data) dd_link;
   int64_t dd_timestamp;
@@ -57,6 +65,7 @@ typedef struct th_descrambler_hint {
   uint32_t dh_interval;
   uint32_t dh_paritycheck;
   uint32_t dh_ecmparity;
+  uint32_t dh_standby_age; /* nowosc: patrz ecm_reset()/descrambler_keys() */
   uint32_t dh_constcw: 1;
   uint32_t dh_quickecm: 1;
   uint32_t dh_multipid: 1;
@@ -318,7 +327,8 @@ descrambler_load_hints(htsmsg_t *m)
     hint.dh_interval = htsmsg_get_s32_or_default(e, "interval", 10000);
     hint.dh_paritycheck = htsmsg_get_s32_or_default(e, "paritycheck", 20);
     hint.dh_ecmparity = str2val_def(htsmsg_get_str(e, "ecmparity"), ecmparitytab, ECM_PARITY_DEFAULT);
-    tvhinfo(LS_DESCRAMBLER, "adding CAID %04X/%04X as%s%s%s interval %ums pc %d ep %s (%s)",
+    hint.dh_standby_age = htsmsg_get_s32_or_default(e, "standby_age", ECM_STANDBY_AGE_DEFAULT);
+    tvhinfo(LS_DESCRAMBLER, "adding CAID %04X/%04X as%s%s%s interval %ums pc %d ep %s sa %ums (%s)",
                             hint.dh_caid, hint.dh_mask,
                             hint.dh_constcw ? " ConstCW" : "",
                             hint.dh_quickecm ? " QuickECM" : "",
@@ -326,6 +336,7 @@ descrambler_load_hints(htsmsg_t *m)
                             hint.dh_interval,
                             hint.dh_paritycheck,
                             val2str(hint.dh_ecmparity, ecmparitytab),
+                            hint.dh_standby_age,
                             htsmsg_get_str(e, "name") ?: "unknown");
     dhint = malloc(sizeof(*dhint));
     *dhint = hint;
@@ -408,6 +419,7 @@ descrambler_service_start ( service_t *t )
   caid_t *ca;
   int i, count, constcw = 0, multipid = 0, interval = 10000, paritycheck = 20;
   int ecmparity = ECM_PARITY_DEFAULT;
+  int standby_age = ECM_STANDBY_AGE_DEFAULT;
 
   if (t->s_scrambled_pass)
     return;
@@ -426,6 +438,7 @@ descrambler_service_start ( service_t *t )
             if (hint->dh_paritycheck) paritycheck = hint->dh_paritycheck;
             if (hint->dh_ecmparity != ECM_PARITY_DEFAULT)
               ecmparity = hint->dh_ecmparity;
+            if (hint->dh_standby_age) standby_age = hint->dh_standby_age;
           }
         }
         count++;
@@ -442,6 +455,7 @@ descrambler_service_start ( service_t *t )
         if (hint->dh_constcw) constcw = 1;
         if (hint->dh_multipid) multipid = 1;
         if (hint->dh_interval) interval = hint->dh_interval;
+        if (hint->dh_standby_age) standby_age = hint->dh_standby_age;
       }
     }
 
@@ -463,6 +477,7 @@ descrambler_service_start ( service_t *t )
     dr->dr_paritycheck = MINMAX(paritycheck, 1, 200) * 188;
     dr->dr_initial_paritycheck = MINMAX(paritycheck, 4, 200) * 188;
     dr->dr_ecm_key_margin = ms2mono(interval) / 5;
+    dr->dr_ecm_standby_age = ms2mono(standby_age);
     dr->dr_key_const = constcw;
     dr->dr_key_multipid = multipid;
     dr->dr_ecm_parity = ecmparity ?: ECM_PARITY_80EVEN_81ODD;
@@ -776,6 +791,24 @@ cont:
                ((mpegts_service_t *)td2->td_service)->s_dvb_svcname,
                td->td_nicename,
                dr->dr_key_const ? " (const)" : "");
+      /*
+       * nowosc: zamiast calkowicie porzucac ten klucz, zachowaj go jako
+       * "zapasowy" w samym td. Patrz ecm_reset() - jesli aktywny klient
+       * sie spozni, ten cache pozwala przelaczyc sie natychmiast, bez
+       * czekania na kolejna pelna wymiane ECM.
+       */
+      td->td_standby_pid   = pid;
+      td->td_standby_type  = type;
+      td->td_standby_valid = 0;
+      if (even && memcmp(empty, even, DESCRAMBLER_KEY_SIZE(type))) {
+        memcpy(td->td_standby_even, even, DESCRAMBLER_KEY_SIZE(type));
+        td->td_standby_valid |= 1;
+      }
+      if (odd && memcmp(empty, odd, DESCRAMBLER_KEY_SIZE(type))) {
+        memcpy(td->td_standby_odd, odd, DESCRAMBLER_KEY_SIZE(type));
+        td->td_standby_valid |= 2;
+      }
+      td->td_standby_time = mclk();
       descrambler_change_keystate(td, DS_IDLE, 0);
       if (td->td_ecm_idle) {
         tvh_mutex_unlock(&t->s_stream_mutex);
@@ -1009,9 +1042,48 @@ key_find_struct( th_descrambler_runtime_t *dr,
 static int
 ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
 {
-  th_descrambler_t *td;
+  th_descrambler_t *td, *promote = NULL;
   th_descrambler_key_t *tk;
   int ret = 0, i;
+  int64_t now = mclk();
+
+  /*
+   * nowosc: zanim wymusimy pelny reset (czyli nowy round-trip ECM na
+   * WSZYSTKICH klientach), sprawdz czy inny, aktualnie nie-aktywny klient
+   * CA nie ma juz swiezo zcache'owanego klucza zapasowego - odrzuconego
+   * wczesniej tylko dlatego, ze inny klient byl DS_RESOLVED. Jesli tak,
+   * przelacz sie na niego od razu, bez czekania na kolejna wymiane ECM.
+   * To realny "hot standby" failover miedzy niezaleznymi zrodlami CA
+   * (np. dvbapi + CCcam do innego serwera).
+   */
+  LIST_FOREACH(td, &t->s_descramblers, td_service_link) {
+    if (td->td_keystate == DS_RESOLVED)
+      continue;
+    if (!td->td_standby_valid)
+      continue;
+    if (td->td_standby_time + dr->dr_ecm_standby_age < now) {
+      td->td_standby_valid = 0; /* zbyt stary - odrzuc */
+      continue;
+    }
+    promote = td;
+    break;
+  }
+
+  if (promote) {
+    tvhinfo(LS_DESCRAMBLER,
+            "%s: fast failover - using cached standby key for service \"%s\" "
+            "instead of full ECM reset", promote->td_nicename, t->s_nicename);
+    LIST_FOREACH(td, &t->s_descramblers, td_service_link)
+      if (td != promote && td->td_keystate == DS_RESOLVED)
+        td->td_ecm_reset(td);
+    descrambler_keys(promote,
+                      promote->td_standby_type,
+                      promote->td_standby_pid,
+                      (promote->td_standby_valid & 1) ? promote->td_standby_even : NULL,
+                      (promote->td_standby_valid & 2) ? promote->td_standby_odd  : NULL);
+    promote->td_standby_valid = 0;
+    return 1;
+  }
 
   /* reset the reader ECM state */
   LIST_FOREACH(td, &t->s_descramblers, td_service_link) {
