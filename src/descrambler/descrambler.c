@@ -48,7 +48,14 @@
  * zamiast pelnego resetu. Konfigurowalne per-CAID w pliku "descrambler"
  * (pole "standby_age", w milisekundach) - patrz descrambler_load_hints().
  */
-#define ECM_STANDBY_AGE_DEFAULT         5000
+/*
+ * nowosc: podniesione z 5000 na 8000 - w praktyce (patrz test na tym
+ * serwerze) wolniejszy sieciowy klient CA potrafi odpowiadac z
+ * opoznieniem tuz ponad 5s (widziane: "Req delay: 5022 ms"), wiec
+ * przy starym progu jego swiezo zcache'owany klucz zapasowy czesto
+ * wygasal, zanim w ogole doszlo do awarii glownego klienta.
+ */
+#define ECM_STANDBY_AGE_DEFAULT         8000
 
 typedef struct th_descrambler_data {
   TAILQ_ENTRY(th_descrambler_data) dd_link;
