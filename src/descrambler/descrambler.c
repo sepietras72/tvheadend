@@ -1105,12 +1105,28 @@ ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
    * moga same wewnetrznie chciec zablokowac ten sam mutex.
    */
   tvh_mutex_lock(&t->s_stream_mutex);
+  /*
+   * nowosc (diagnostyka): tymczasowy trace pokazujacy realny stan cache'u
+   * standby w momencie awarii - do usuniecia po zdiagnozowaniu, dlaczego
+   * fast failover sie nie uruchamia mimo pozornie wystarczajacego
+   * standby_age.
+   */
+  tvhtrace(LS_DESCRAMBLER,
+           "ecm_reset: service \"%s\" standby_age=%ldms, scanning descramblers",
+           t->s_nicename, (long)(dr->dr_ecm_standby_age / 1000));
   LIST_FOREACH(td, &t->s_descramblers, td_service_link) {
+    tvhtrace(LS_DESCRAMBLER,
+             "ecm_reset:   %s keystate=%s standby_valid=%d age=%ldms",
+             td->td_nicename, descrambler_keystate2str(td->td_keystate),
+             td->td_standby_valid,
+             (long)(td->td_standby_valid ? (now - td->td_standby_time) / 1000 : -1));
     if (td->td_keystate == DS_RESOLVED)
       continue;
     if (!td->td_standby_valid)
       continue;
     if (td->td_standby_time + dr->dr_ecm_standby_age < now) {
+      tvhtrace(LS_DESCRAMBLER, "ecm_reset:   %s standby too old, discarding",
+               td->td_nicename);
       td->td_standby_valid = 0; /* zbyt stary - odrzuc */
       continue;
     }
