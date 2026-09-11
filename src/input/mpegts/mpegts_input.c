@@ -1920,7 +1920,23 @@ mpegts_input_stream_status
   st->stats.unc   = atomic_get(&mmi->tii_stats.unc);
   st->stats.cc    = atomic_get(&mmi->tii_stats.cc);
   st->stats.te    = atomic_get(&mmi->tii_stats.te);
-  st->stats.bps   = atomic_exchange(&mmi->tii_stats.bps, 0) * 8;
+  {
+    /*
+     * nowosc: surowa probka to bity naliczone w OSTATNIEJ ~1s (okno
+     * miedzy kolejnymi odczytami tego licznika) - przy naturalnie
+     * nierownomiernym (burst) naplywie pakietow TS w obrebie takiego
+     * okna to widocznie "skacze" w GUI mimo stalej sredniej
+     * przepustowosci. Wygladzamy wykladniczo (EWMA, waga ~1/3 nowej
+     * probki - responsywne na realne zmiany typu start/stop
+     * transkodowania, ale bez skokow od probki do probki) i wysylamy
+     * dalej JUZ wygladzona wartosc - dziala jednakowo dla webui
+     * (ExtJS i Vue), api i htsp, bo wszystkie czytaja to samo pole.
+     */
+    int64_t raw = atomic_exchange(&mmi->tii_stats.bps, 0) * 8;
+    mmi->mmi_bps_smoothed = mmi->mmi_bps_smoothed ?
+      (mmi->mmi_bps_smoothed * 2 + raw) / 3 : raw;
+    st->stats.bps = (int)mmi->mmi_bps_smoothed;
+  }
 }
 
 void

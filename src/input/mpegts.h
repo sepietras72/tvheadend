@@ -672,6 +672,17 @@ struct mpegts_mux_instance
   int64_t         mmi_quality_unc_prev;
   int             mmi_quality_score;
   int             mmi_quality_samples;
+
+  /*
+   * nowosc (wygladzanie bitrate w GUI): "bps" wysylane do UI (webui/
+   * Vue oraz api/htsp) to surowa liczba bitow z OSTATNIEJ ~1-sekundowej
+   * probki (patrz mpegts_input_stream_status()) - przy naturalnie
+   * nierownomiernym (burst) dostarczaniu pakietow TS w obrebie tego
+   * okna to widocznie "skacze" w GUI nawet przy stalej sredniej
+   * przepustowosci. mmi_bps_smoothed to EWMA tej wartosci - wygladzone
+   * liczby sa tym, co faktycznie wysylamy dalej.
+   */
+  int64_t         mmi_bps_smoothed;
 };
 
 struct mpegts_mux_sub
