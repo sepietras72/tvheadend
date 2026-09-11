@@ -19,6 +19,7 @@
 #include "tvheadend.h"
 #include "settings.h"
 #include "caclient.h"
+#include "descrambler.h"
 #include "dvbcam.h"
 
 const idclass_t *caclient_classes[] = {
@@ -347,7 +348,9 @@ caclient_start ( struct service *t )
 
   tvh_mutex_lock(&caclients_mutex);
   TAILQ_FOREACH(cac, &caclients, cac_link)
-    if (cac->cac_enabled)
+    /* nowosc (nowa #2): opcjonalny routing czytnikow per CAID - patrz
+       descrambler_client_allowed() / data/conf/descrambler_routing */
+    if (cac->cac_enabled && descrambler_client_allowed(t, cac->cac_name))
       cac->cac_start(cac, t);
   tvh_mutex_unlock(&caclients_mutex);
 #if ENABLE_TSDEBUG

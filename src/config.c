@@ -17,10 +17,12 @@
  */
 
 #include <ctype.h>
+#include <dirent.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "tvheadend.h"
@@ -1613,6 +1615,187 @@ fatal:
 }
 
 /*
+ * nowosc (nowa #5 - okresowy backup konfiguracji w tle):
+ *
+ * Podobne do dobackup() powyzej (ten sam tar + lista --exclude), ale
+ * CELOWO inne w dwoch miejscach, bo dobackup() jest robione dla
+ * jednorazowego backupu migracyjnego PRZED uruchomieniem innych watkow:
+ *
+ *  1. dobackup() na bledzie robi exit() calego procesu - dobre dla
+ *     backupu-przed-migracja (nie chcesz kontynuowac migracji configu
+ *     bez backupu), fatalne dla backupu w tle na juz dzialajacym
+ *     serwerze. Tutaj kazdy blad tylko loguje i probuje ponownie przy
+ *     nastepnym tyknieciu timera.
+ *  2. dobackup() robi chdir(root) na czas tar, potem chdir() z powrotem.
+ *     To jest bezpieczne na starcie (nic innego jeszcze nie dziala), ale
+ *     NIEBEZPIECZNE tutaj - chdir() zmienia biezacy katalog CALEGO
+ *     procesu, a na zywym serwerze inne watki w tej samej chwili moga
+ *     odwolywac sie do sciezek wzglednych (np. hot-reload configu CA w
+ *     descrambler.c). Zamiast chdir() uzywamy "tar -C <root>", ktore nie
+ *     rusza CWD procesu wcale.
+ *
+ * Dodatkowo: pisze do dowolnego, konfigurowalnego katalogu (nie tylko
+ * <root>/backup) z timestampem w nazwie i przycina stare kopie ponad
+ * "keep" najnowszych - dobackup() nie robi ani jednego, ani drugiego.
+ */
+
+static mtimer_t config_backup_periodic_timer;
+
+static int
+config_backup_name_cmp ( const void *a, const void *b )
+{
+  return strcmp(*(const char * const *)a, *(const char * const *)b);
+}
+
+static void
+config_backup_periodic_prune ( const char *dir, uint32_t keep )
+{
+  DIR *d;
+  struct dirent *de;
+  char **names = NULL;
+  int n = 0, cap = 0, i;
+  char path[PATH_MAX];
+
+  if ((d = opendir(dir)) == NULL)
+    return;
+  while ((de = readdir(d)) != NULL) {
+    if (strncmp(de->d_name, "tvheadend-conf-", 15) != 0)
+      continue;
+    if (!strstr(de->d_name, ".tar.bz2"))
+      continue;
+    if (n >= cap) {
+      cap = cap ? cap * 2 : 16;
+      names = realloc(names, cap * sizeof(char *));
+    }
+    names[n++] = strdup(de->d_name);
+  }
+  closedir(d);
+  if (names == NULL)
+    return;
+  /* timestamp w nazwie (YYYYMMDD-HHMMSS) -> sortowanie leksykalne
+     rosnaco = sortowanie chronologiczne rosnaco (najstarsze pierwsze) */
+  qsort(names, n, sizeof(char *), config_backup_name_cmp);
+  for (i = 0; i < n; i++) {
+    if (i < n - (int)keep) {
+      strlcpy(path, dir, sizeof(path));
+      strlcat(path, "/", sizeof(path));
+      strlcat(path, names[i], sizeof(path));
+      if (unlink(path) == 0)
+        tvhinfo(LS_CONFIG, "periodic backup: pruned old snapshot \"%s\"", path);
+      else
+        tvherror(LS_CONFIG, "periodic backup: failed to prune \"%s\": %s",
+                 path, strerror(errno));
+    }
+    free(names[i]);
+  }
+  free(names);
+}
+
+static void
+config_backup_periodic_run ( void *aux )
+{
+  const char *root = hts_settings_get_root();
+  const char *tarbin = NULL;
+  char destdir[PATH_MAX], outfile[PATH_MAX], errtxt[128];
+  const char *argv[] = {
+    NULL, "-C", root ?: ".", "-cjf", outfile,
+    "--exclude", "backup",
+    "--exclude", "recordings",
+    "--exclude", "epggrab/*.sock",
+    "--exclude", "timeshift/buffer",
+    "--exclude", "imagecache/meta",
+    "--exclude", "imagecache/data",
+    ".", NULL
+  };
+  struct tm tm;
+  time_t now;
+  pid_t pid;
+  int code;
+
+  /* zawsze przezbroj kolejny cykl jako pierwsze, zanim cokolwiek moze
+     zawiesc/wrocic wczesniej - jeden nieudany backup nie moze ubic
+     wszystkie przyszle */
+  mtimer_arm_rel(&config_backup_periodic_timer, config_backup_periodic_run, NULL,
+                 sec2mono(MAX(1U, config.backup_periodic_hours) * 3600));
+
+  if (!config.backup_periodic_enabled || root == NULL)
+    return;
+
+  if (!access("/bin/tar", X_OK))
+    tarbin = "/bin/tar";
+  else if (!access("/usr/bin/tar", X_OK))
+    tarbin = "/usr/bin/tar";
+  else if (!access("/usr/local/bin/tar", X_OK))
+    tarbin = "/usr/local/bin/tar";
+  else {
+    tvherror(LS_CONFIG, "periodic backup: tar program not found");
+    return;
+  }
+  argv[0] = tarbin;
+
+  if (config.backup_periodic_path && *config.backup_periodic_path) {
+    strlcpy(destdir, config.backup_periodic_path, sizeof(destdir));
+  } else {
+    strlcpy(destdir, root, sizeof(destdir));
+    strlcat(destdir, "/backup", sizeof(destdir));
+  }
+
+  if (makedirs(LS_CONFIG, destdir, 0700, 1, -1, -1)) {
+    tvherror(LS_CONFIG, "periodic backup: cannot create destination \"%s\"", destdir);
+    return;
+  }
+
+  now = time(NULL);
+  localtime_r(&now, &tm);
+  {
+    /* nowosc: skladamy nazwe w dwoch krokach (strlcpy/strlcat zamiast
+       jednego snprintf("%s/...")), bo GCC -Wformat-truncation nie umie
+       udowodnic, ze destdir (PATH_MAX) + sufiks zawsze zmiesci sie w
+       outfile (tez PATH_MAX) - a projekt buduje sie z -Werror. */
+    char ts[128];   /* szeroki margines - GCC -Wformat-truncation liczy
+                       pesymistycznie az do szerokosci int dla kazdego %d */
+    snprintf(ts, sizeof(ts), "tvheadend-conf-%04d%02d%02d-%02d%02d%02d.tar.bz2",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
+    strlcpy(outfile, destdir, sizeof(outfile));
+    strlcat(outfile, "/", sizeof(outfile));
+    strlcat(outfile, ts, sizeof(outfile));
+  }
+
+  tvhinfo(LS_CONFIG, "periodic backup: writing \"%s\"", outfile);
+  if (spawnv(argv[0], (void *)argv, &pid, 1, 1)) {
+    tvherror(LS_CONFIG, "periodic backup: failed to start tar");
+    return;
+  }
+  while ((code = spawn_reap(pid, errtxt, sizeof(errtxt))) == -EAGAIN)
+    tvh_safe_usleep(20000);
+  if (code && code != -ECHILD) {
+    tvherror(LS_CONFIG, "periodic backup: tar exited with code %d (%s)", code, errtxt);
+    unlink(outfile);   /* nie zostawiaj polowicznego archiwum */
+    return;
+  }
+  tvhinfo(LS_CONFIG, "periodic backup: completed (\"%s\")", outfile);
+  config_backup_periodic_prune(destdir, config.backup_periodic_keep);
+}
+
+void
+config_backup_periodic_init ( void )
+{
+  /* pierwsza proba niedlugo po starcie (5 min - nie zapychac rozruchu),
+     kolejne wg config.backup_periodic_hours (przezbrajane w samej
+     config_backup_periodic_run(), nawet gdy backup jest wylaczony -
+     zeby wlaczenie w locie zadzialalo bez restartu) */
+  mtimer_arm_rel(&config_backup_periodic_timer, config_backup_periodic_run, NULL,
+                 sec2mono(300));
+}
+
+void
+config_backup_periodic_done ( void )
+{
+  mtimer_disarm(&config_backup_periodic_timer);
+}
+
+/*
  * Migration table
  */
 static const config_migrate_t config_migrate_table[] = {
@@ -1810,6 +1993,12 @@ config_boot
   config.ticket_expires = 5 * 60;
   config.dscp = -1;
   config.descrambler_buffer = 9000;
+  config.descrambler_buffer_adaptive = 1;   /* nowosc (nowa #1): domyslnie wlaczone, tylko rosnie w gore */
+  config.descrambler_ecm_race = 0;   /* nowosc (#1): domyslnie wylaczony */
+  config.mpegts_quality_ranking = 0;   /* nowosc (nowa #1 ogolna): opt-in, zmienia wybor tunera */
+  config.backup_periodic_enabled = 0;  /* nowosc (nowa #5): opt-in, wybierz cel przed wlaczeniem */
+  config.backup_periodic_hours = 24;
+  config.backup_periodic_keep = 7;
   config.epg_compress = 1;
   config.epg_cut_window = 5*60;
   config.epg_update_window = 24*3600;
@@ -2820,6 +3009,49 @@ const idclass_t config_class = {
     },
     {
       .type   = PT_BOOL,
+      .id     = "descrambler_buffer_adaptive",
+      .name   = N_("Descrambler buffer auto-tuning"),
+      .desc   = N_("Learn, per service, how much backlog actually accumulates "
+                   "while waiting for CA keys and grow the descrambler buffer "
+                   "above the fixed size when a channel genuinely needs it. "
+                   "Never goes below the configured buffer size above - only "
+                   "raises it, so it is safe to leave on."),
+      .off    = offsetof(config_t, descrambler_buffer_adaptive),
+      .opts   = PO_EXPERT,
+      .group  = 8,
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "descrambler_ecm_race",
+      .name   = N_("Descrambler ECM race (keep all CA readers warm)"),
+      .desc   = N_("When enabled, secondary CA clients that already lost the "
+                   "\"first key wins\" race are NOT put to sleep - they keep "
+                   "following ECM updates and refreshing a standby key, so a "
+                   "failover always has a fresh key from an independent server. "
+                   "Costs N times the ECM traffic to the card servers; some "
+                   "accounts limit concurrent streams and will answer NOK. "
+                   "Leave off unless you have spare capacity on every reader."),
+      .off    = offsetof(config_t, descrambler_ecm_race),
+      .opts   = PO_EXPERT,
+      .group  = 8,
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "mpegts_quality_ranking",
+      .name   = N_("Tuner quality auto-ranking"),
+      .desc   = N_("Learn, per tuner and mux, how many continuity/"
+                   "uncorrected-block errors actually occur and nudge the "
+                   "tuner selection (a small adjustment on top of the "
+                   "configured Priority) towards the historically cleaner "
+                   "tuner when more than one can receive the same mux. "
+                   "Never overrides a deliberate large Priority gap - only "
+                   "breaks near-ties. Learning resets on restart."),
+      .off    = offsetof(config_t, mpegts_quality_ranking),
+      .opts   = PO_EXPERT,
+      .group  = 8,
+    },
+    {
+      .type   = PT_BOOL,
       .id     = "parser_backlog",
       .name   = N_("Packet backlog"),
       .desc   = N_("Send previous stream frames to upper layers "
@@ -2837,6 +3069,51 @@ const idclass_t config_class = {
                    "(when a new mux starts for the target tuner). "
                    "Note that previous counters will be lost."),
       .off    = offsetof(config_t, auto_clear_input_counters),
+      .opts   = PO_EXPERT,
+      .group  = 8,
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "backup_periodic_enabled",
+      .name   = N_("Periodic configuration backup"),
+      .desc   = N_("Periodically write a tar.bz2 snapshot of the whole "
+                   "configuration directory (recordings, timeshift buffer "
+                   "and imagecache excluded), so a bad manual edit or a "
+                   "disk failure can be rolled back. Off by default - pick "
+                   "a destination directory first."),
+      .off    = offsetof(config_t, backup_periodic_enabled),
+      .opts   = PO_EXPERT,
+      .group  = 8,
+    },
+    {
+      .type   = PT_STR,
+      .id     = "backup_periodic_path",
+      .name   = N_("Backup destination directory"),
+      .desc   = N_("Where to write periodic configuration backups. Leave "
+                   "blank to use <config dir>/backup (the same place used "
+                   "for the one-time upgrade backup). Point it at a "
+                   "second disk or a network mount for real protection "
+                   "against a disk failure."),
+      .off    = offsetof(config_t, backup_periodic_path),
+      .opts   = PO_EXPERT,
+      .group  = 8,
+    },
+    {
+      .type   = PT_U32,
+      .id     = "backup_periodic_hours",
+      .name   = N_("Backup interval (hours)"),
+      .desc   = N_("How often to take a configuration backup."),
+      .off    = offsetof(config_t, backup_periodic_hours),
+      .opts   = PO_EXPERT,
+      .group  = 8,
+    },
+    {
+      .type   = PT_U32,
+      .id     = "backup_periodic_keep",
+      .name   = N_("Backups to keep"),
+      .desc   = N_("How many of the most recent periodic backups to keep "
+                   "- older ones are deleted automatically."),
+      .off    = offsetof(config_t, backup_periodic_keep),
       .opts   = PO_EXPERT,
       .group  = 8,
     },

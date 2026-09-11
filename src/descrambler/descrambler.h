@@ -84,6 +84,21 @@ typedef struct th_descrambler {
   uint8_t  td_standby_valid;   /* bit0=even valid, bit1=odd valid */
   int64_t  td_standby_time;    /* mclk() w momencie zapisania cache */
 
+  /*
+   * nowosc (#3 - metryki czytnika): statystyki ECM per klient CA, do
+   * diagnostyki "ktory serwer zwalnia / zwraca NOK" bez grepania logow.
+   * Akumulowane w descrambler_notify() (udana odpowiedz z ecmtime) oraz
+   * descrambler_change_keystate() (przejscie w DS_FORBIDDEN). Widoczne w
+   * logu (LS_DESCRAMBLER, info) - podsumowanie co kilkanascie ECM i przy
+   * parkowaniu czytnika.
+   */
+  uint32_t td_ecm_count;      /* udane odpowiedzi ECM z kluczem            */
+  uint32_t td_ecm_nok;        /* przejscia w DS_FORBIDDEN (access denied)  */
+  uint32_t td_ecm_time_min;   /* ms - najszybsza odpowiedz (0 = brak)     */
+  uint32_t td_ecm_time_max;   /* ms - najwolniejsza                        */
+  uint32_t td_ecm_time_last;  /* ms - ostatnia                             */
+  uint64_t td_ecm_time_sum;   /* ms - suma (srednia = sum / count)         */
+
 } th_descrambler_t;
 
 typedef struct th_descrambler_key {
@@ -121,6 +136,22 @@ typedef struct th_descrambler_runtime {
   int64_t  dr_ecm_standby_age; /* nowosc: patrz ecm_reset(), konfigurowalne per-CAID */
   int64_t  dr_last_err;
   int64_t  dr_force_skip;
+  /*
+   * nowosc (#4 - dozorca wyjscia): dr_ok_time to mclk() ostatniego
+   * faktycznie odszyfrowanego pakietu. Gdy wejscie sypie danymi (bufor
+   * pelny), a dr_ok_time nie rusza sie dluzej niz prog, descrambler
+   * probuje nie-destrukcyjnej promocji standby (descrambler_standby_promote)
+   * zamiast biernie czekac. dr_watchdog_last ogranicza czestotliwosc prob.
+   */
+  int64_t  dr_ok_time;
+  int64_t  dr_watchdog_last;
+  /*
+   * nowosc (nowa #1 - adaptacyjny bufor): "znak wodny" (w pakietach TS,
+   * juz z marginesem) tego, ile realnie naplynelo zanim ostatnie klucze
+   * dotarly - EWMA, patrz uzycie w descrambler_keys()/descrambler_descramble().
+   * 0 = jeszcze nie zmierzono, uzyj config.descrambler_buffer jak dotychczas.
+   */
+  uint32_t dr_adaptive_buflen;
   th_descrambler_key_t dr_keys[DESCRAMBLER_MAX_KEYS];
   th_descrambler_key_t *dr_key_last;
   TAILQ_HEAD(, th_descrambler_data) dr_queue;
@@ -206,6 +237,13 @@ const char *descrambler_keytype2str( th_descrambler_keystate_t keytype );
 void descrambler_service_start ( struct service *t );
 void descrambler_service_stop  ( struct service *t );
 void descrambler_caid_changed  ( struct service *t );
+/*
+ * nowosc (nowa #2): czy klientowi CA o danej nazwie wolno wystartowac dla
+ * tej uslugi wg regul w "data/conf/descrambler_routing"? Brak reguly
+ * pasujacej do CAID-ow uslugi = zawsze zezwol (patrz descrambler.c).
+ * Wolane z caclient_start().
+ */
+int  descrambler_client_allowed( struct service *t, const char *cac_name );
 int  descrambler_resolved      ( struct service *t, th_descrambler_t *ignore );
 /*
  * nowosc: probuje natychmiast promowac zcache'owany klucz zapasowy od

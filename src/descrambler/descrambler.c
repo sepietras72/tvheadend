@@ -18,6 +18,8 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <sys/stat.h>
+
 #include "tvheadend.h"
 #include "config.h"
 #include "settings.h"
@@ -84,10 +86,70 @@ typedef struct th_descrambler_hint {
   uint32_t dh_multipid: 1;
 } th_descrambler_hint_t;
 
+/*
+ * nowosc (nowa #2 - routing czytnikow CA per CAID): opcjonalne reguly z
+ * "data/conf/descrambler_routing" ograniczajace, ktore skonfigurowane
+ * klienty CA (po ich nazwie/tytule) wolno w ogole uruchomic dla uslugi
+ * niosacej dany CAID. Bez tego pliku (albo pustego) - zero zmiany
+ * zachowania, tak jak dzisiaj: caclient_start() odpytuje WSZYSTKICH
+ * wlaczonych klientow dla kazdej uslugi, co przy kilku serwerach
+ * card-sharingu z limitem "1 rownolegly strumien" powoduje kolizje
+ * ("Already has a key for service" / NOK).
+ */
+typedef struct th_descrambler_route {
+  TAILQ_ENTRY(th_descrambler_route) dt_link;
+  uint16_t dt_caid;
+  uint16_t dt_mask;
+  char    *dt_allow;   /* lista nazw klientow (po przecinku) - jesli ustawiona,
+                           TYLKO wymienieni startuja dla tego CAID */
+  char    *dt_deny;    /* lista nazw klientow do wykluczenia; brana pod uwage
+                           tylko gdy dt_allow jest puste */
+} th_descrambler_route_t;
+
+static TAILQ_HEAD( , th_descrambler_route) ca_routes;
+
 TAILQ_HEAD(th_descrambler_queue, th_descrambler_data);
 static TAILQ_HEAD( , th_descrambler_hint) ca_hints;
 
 static int ca_hints_quickecm;
+
+/*
+ * nowosc (#2 - hot-reload podpowiedzi CA):
+ *
+ * Do tej pory plik "data/conf/descrambler" byl wczytywany DOKLADNIE RAZ w
+ * descrambler_init() i lista ca_hints traktowana jako niezmienna do konca
+ * zycia procesu - kazda zmiana interval/paritycheck/quickecm/... wymagala
+ * pelnego restartu TVH. Teraz plik jest pilnowany (mtime) przez lekki
+ * mtimer i przeladowywany "w locie". Nowe wartosci dotycza uslug
+ * uruchamianych PO przeladowaniu (biezace strumienie maja juz skopiowane
+ * wartosci w swoim th_descrambler_runtime_t - trzeba je przestartowac,
+ * np. przełączając kanał).
+ *
+ * ca_hints_mutex serializuje odczyt listy (descrambler_service_start,
+ * descrambler_quick_ecm) z jej podmiana (descrambler_reload_hints).
+ */
+static tvh_mutex_t ca_hints_mutex;
+static int64_t     ca_hints_file_mtime;
+static mtimer_t    ca_hints_reload_timer;
+
+/*
+ * nowosc (#1 - wyscig ECM / "ciepli" czytnicy):
+ *
+ * Domyslnie (0) zachowanie bez zmian: pierwszy klient CA, ktory dostarczy
+ * klucz, zostaje aktywny, a pozostali przechodza w DS_IDLE (td_ecm_idle -
+ * przestaja przetwarzac ECM). Gdy jeden serwer sie zapcha, failover
+ * korzysta tylko z JEDNEGO, byc moze juz przeterminowanego, cache'u
+ * standby.
+ *
+ * Wlaczone (1): pozostali czytnicy NIE ida w idle - dalej podazaja za
+ * zmianami ECM i na biezaco odswiezaja swoj klucz standby (td_standby_*).
+ * Dzieki temu w chwili awarii aktywnego czytnika failover ma zawsze
+ * swiezy zapas z innego, niezaleznego serwera. Koszt: N-krotny ruch ECM
+ * do serwerow kart - niektore konta CCcam maja limit 1 rownoleglego
+ * strumienia i beda zwracac NOK ("Already has a key for service").
+ * Dlatego opcja jest domyslnie wylaczona i wlaczana swiadomie.
+ */
+#define ecm_race_enabled() (config.descrambler_ecm_race)
 
 /*
  *
@@ -373,36 +435,163 @@ descrambler_load_hints(htsmsg_t *m)
 }
 
 /*
+ * nowosc (nowa #2): wczytaj reguly routingu czytnikow z listy "route" w
+ * "data/conf/descrambler_routing". Format zblizony do podpowiedzi CAID:
+ *   { "caid": "1884", "mask": "FFFF", "allow": "testowy,s2.skyhd1" }
+ *   { "caid": "1861", "mask": "FFFF", "deny": "s1.skyhd1" }
+ * "allow" - lista nazw (tytulow) klientow CA po przecinku; jesli podana,
+ *           TYLKO oni startuja dla uslug niosacych ten CAID.
+ * "deny"  - jak wyzej, ale wykluczajaco; brana pod uwage tylko gdy "allow"
+ *           nie jest ustawione dla danej reguly.
+ * Zob. descrambler_client_allowed().
+ */
+static void
+descrambler_load_routes(htsmsg_t *m)
+{
+  th_descrambler_route_t *rt;
+  htsmsg_t *e;
+  htsmsg_field_t *f;
+  const char *s, *allow, *deny;
+
+  HTSMSG_FOREACH(f, m) {
+    if (!(e = htsmsg_field_get_map(f))) continue;
+    if ((s = htsmsg_get_str(e, "caid")) == NULL) continue;
+    allow = htsmsg_get_str(e, "allow");
+    deny  = htsmsg_get_str(e, "deny");
+    if (!allow && !deny) continue;
+    rt = calloc(1, sizeof(*rt));
+    rt->dt_caid = strtol(s, NULL, 16);
+    rt->dt_mask = 0xffff;
+    if ((s = htsmsg_get_str(e, "mask")) != NULL)
+      rt->dt_mask = strtol(s, NULL, 16);
+    if (allow) rt->dt_allow = strdup(allow);
+    if (deny)  rt->dt_deny  = strdup(deny);
+    tvhinfo(LS_DESCRAMBLER, "adding CA route for CAID %04X/%04X: %s=%s",
+            rt->dt_caid, rt->dt_mask,
+            allow ? "allow" : "deny", allow ?: deny);
+    TAILQ_INSERT_TAIL(&ca_routes, rt, dt_link);
+  }
+}
+
+/*
+ * nowosc (#2 / nowa #2): oproznij podpowiedzi CAID i reguly routingu.
+ * Wolane pod ca_hints_mutex.
+ */
+static void
+descrambler_clear_hints ( void )
+{
+  th_descrambler_hint_t *hint;
+  th_descrambler_route_t *rt;
+
+  while ((hint = TAILQ_FIRST(&ca_hints)) != NULL) {
+    TAILQ_REMOVE(&ca_hints, hint, dh_link);
+    free(hint);
+  }
+  ca_hints_quickecm = 0;
+  while ((rt = TAILQ_FIRST(&ca_routes)) != NULL) {
+    TAILQ_REMOVE(&ca_routes, rt, dt_link);
+    free(rt->dt_allow);
+    free(rt->dt_deny);
+    free(rt);
+  }
+}
+
+/*
+ * nowosc (#2 / nowa #2): najnowsze mtime spomiedzy plikow "descrambler" i
+ * "descrambler_routing" (sciezka runtime i wbudowana "data/conf/..." -
+ * hts_settings_load() probuje obu). Zwraca 0, gdy zaden plik nie istnieje
+ * na dysku (np. tylko wersja wkompilowana w filebundle).
+ */
+static int64_t
+descrambler_hints_mtime ( void )
+{
+  static const char *names[] = { "descrambler", "descrambler_routing" };
+  char path[PATH_MAX];
+  struct stat st;
+  int64_t mt = 0;
+  unsigned i;
+
+  for (i = 0; i < ARRAY_SIZE(names); i++) {
+    if (hts_settings_buildpath(path, sizeof(path), "%s", names[i]) == 0 &&
+        stat(path, &st) == 0 && (int64_t)st.st_mtime > mt)
+      mt = (int64_t)st.st_mtime;
+    snprintf(path, sizeof(path), "data/conf/%s", names[i]);
+    if (stat(path, &st) == 0 && (int64_t)st.st_mtime > mt)
+      mt = (int64_t)st.st_mtime;
+  }
+  return mt;
+}
+
+/*
+ * nowosc (#2 / nowa #2): (prze)laduj obie listy z plikow. initial=1 przy
+ * starcie (cicho), initial=0 przy hot-reload (z logiem i wyczyszczeniem
+ * starych list).
+ */
+static void
+descrambler_reload_hints ( int initial )
+{
+  htsmsg_t *c, *m;
+
+  tvh_mutex_lock(&ca_hints_mutex);
+  if (!initial) {
+    tvhinfo(LS_DESCRAMBLER, "reloading CA hints/routing (config file changed)");
+    descrambler_clear_hints();
+  }
+  if ((c = hts_settings_load("descrambler")) != NULL) {
+    if ((m = htsmsg_get_list(c, "caid")) != NULL)
+      descrambler_load_hints(m);
+    htsmsg_destroy(c);
+  }
+  if ((c = hts_settings_load("descrambler_routing")) != NULL) {
+    if ((m = htsmsg_get_list(c, "route")) != NULL)
+      descrambler_load_routes(m);
+    htsmsg_destroy(c);
+  }
+  ca_hints_file_mtime = descrambler_hints_mtime();
+  tvh_mutex_unlock(&ca_hints_mutex);
+}
+
+/*
+ * nowosc (#2): lekki dozorca - co 15s sprawdza mtime i przeladowuje.
+ */
+static void
+descrambler_hints_reload_cb ( void *aux )
+{
+  if (tvheadend_is_running()) {
+    int64_t mt = descrambler_hints_mtime();
+    if (mt && mt != ca_hints_file_mtime)
+      descrambler_reload_hints(0);
+    mtimer_arm_rel(&ca_hints_reload_timer, descrambler_hints_reload_cb, NULL,
+                   sec2mono(15));
+  }
+}
+
+/*
  *
  */
 void
 descrambler_init ( void )
 {
-  htsmsg_t *c, *m;
-
+  tvh_mutex_init(&ca_hints_mutex, NULL);
   TAILQ_INIT(&ca_hints);
+  TAILQ_INIT(&ca_routes);
   ca_hints_quickecm = 0;
 
   caclient_init();
 
-  if ((c = hts_settings_load("descrambler")) != NULL) {
-    m = htsmsg_get_list(c, "caid");
-    if (m)
-      descrambler_load_hints(m);
-    htsmsg_destroy(c);
-  }
+  descrambler_reload_hints(1);
+  mtimer_arm_rel(&ca_hints_reload_timer, descrambler_hints_reload_cb, NULL,
+                 sec2mono(15));
 }
 
 void
 descrambler_done ( void )
 {
-  th_descrambler_hint_t *hint;
-
+  mtimer_disarm(&ca_hints_reload_timer);
   caclient_done();
-  while ((hint = TAILQ_FIRST(&ca_hints)) != NULL) {
-    TAILQ_REMOVE(&ca_hints, hint, dh_link);
-    free(hint);
-  }
+  tvh_mutex_lock(&ca_hints_mutex);
+  descrambler_clear_hints();
+  tvh_mutex_unlock(&ca_hints_mutex);
 }
 
 /*
@@ -414,21 +603,110 @@ descrambler_quick_ecm ( mpegts_service_t *t, int pid )
   elementary_stream_t *st;
   th_descrambler_hint_t *hint;
   caid_t *ca;
+  int r = 0;
 
   if (!ca_hints_quickecm)
     return 0;
+  tvh_mutex_lock(&ca_hints_mutex);       /* nowosc (#2): lista moze byc przeladowana */
   TAILQ_FOREACH(st, &t->s_components.set_filter, es_filter_link) {
     if (st->es_pid != pid) continue;
     TAILQ_FOREACH(hint, &ca_hints, dh_link) {
       if (!hint->dh_quickecm) continue;
       LIST_FOREACH(ca, &st->es_caids, link) {
         if (ca->use == 0) continue;
-        if (hint->dh_caid == (ca->caid & hint->dh_mask))
-          return 1;
+        if (hint->dh_caid == (ca->caid & hint->dh_mask)) {
+          r = 1;
+          goto out;
+        }
       }
     }
   }
+out:
+  tvh_mutex_unlock(&ca_hints_mutex);
+  return r;
+}
+
+/*
+ * nowosc (nowa #2): czy "name" wystepuje na liscie rozdzielonej przecinkami
+ * (bez rozroznienia wielkosci liter, biale znaki wokol elementow ignorowane)?
+ */
+static int
+namelist_contains ( const char *list, const char *name )
+{
+  const char *p = list, *comma;
+  size_t namelen = strlen(name), n;
+
+  if (list == NULL || name == NULL)
+    return 0;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
+    if (!*p) break;
+    comma = strchr(p, ',');
+    n = comma ? (size_t)(comma - p) : strlen(p);
+    while (n > 0 && (p[n-1] == ' ' || p[n-1] == '\t')) n--;
+    if (n == namelen && strncasecmp(p, name, n) == 0)
+      return 1;
+    p += comma ? (size_t)(comma - p) + 1 : n;
+  }
   return 0;
+}
+
+/*
+ * nowosc (nowa #2 - routing czytnikow CA): czy klient CA o nazwie
+ * "cac_name" ma w ogole prawo wystartowac dla tej uslugi? Wolane z
+ * caclient_start() PRZED wywolaniem cac->cac_start() dla kazdego
+ * wlaczonego klienta - to jedyne miejsce wspolne dla wszystkich rodzin
+ * klientow (cwc/cccam/capmt/capmt2/dvbcam), wiec filtrowanie tutaj
+ * dziala bez zadnych zmian w samych klientach.
+ *
+ * Semantyka (patrz tez komentarz przy th_descrambler_route_t): brak
+ * pliku/regul pasujacych do CAID-ow tej uslugi = zezwol (zero zmiany
+ * zachowania wzgledem stanu sprzed tej funkcji). Jesli KTORAKOLWIEK
+ * pasujaca regula ma "allow", klient musi byc na liscie choc jednej
+ * takiej reguly. W przeciwnym razie (same reguly "deny") - odrzucany
+ * jest tylko klient wymieniony w "deny".
+ */
+int
+descrambler_client_allowed ( service_t *t, const char *cac_name )
+{
+  th_descrambler_route_t *rt;
+  elementary_stream_t *st;
+  caid_t *ca;
+  int have_allow_rule = 0, allowed_explicitly = 0, denied = 0;
+
+  if (TAILQ_EMPTY(&ca_routes) || cac_name == NULL || *cac_name == '\0')
+    return 1;
+
+  tvh_mutex_lock(&ca_hints_mutex);
+
+#define CHECK_ROUTE(caidval) \
+  TAILQ_FOREACH(rt, &ca_routes, dt_link) { \
+    if (rt->dt_caid != ((caidval) & rt->dt_mask)) continue; \
+    if (rt->dt_allow) { \
+      have_allow_rule = 1; \
+      if (namelist_contains(rt->dt_allow, cac_name)) \
+        allowed_explicitly = 1; \
+    } else if (rt->dt_deny && namelist_contains(rt->dt_deny, cac_name)) { \
+      denied = 1; \
+    } \
+  }
+
+  if (t->s_dvb_forcecaid) {
+    CHECK_ROUTE(t->s_dvb_forcecaid);
+  } else {
+    TAILQ_FOREACH(st, &t->s_components.set_filter, es_filter_link)
+      LIST_FOREACH(ca, &st->es_caids, link) {
+        if (ca->use == 0) continue;
+        CHECK_ROUTE(ca->caid);
+      }
+  }
+#undef CHECK_ROUTE
+
+  tvh_mutex_unlock(&ca_hints_mutex);
+
+  if (have_allow_rule)
+    return allowed_explicitly;
+  return !denied;
 }
 
 /*
@@ -444,16 +722,17 @@ descrambler_service_start ( service_t *t )
   th_descrambler_hint_t *hint;
   elementary_stream_t *st;
   caid_t *ca;
-  int i, count, constcw = 0, multipid = 0, interval = 10000, paritycheck = 20;
+  int i, count = 0, constcw = 0, multipid = 0, interval = 10000, paritycheck = 20;
   int ecmparity = ECM_PARITY_DEFAULT;
   int standby_age = ECM_STANDBY_AGE_DEFAULT;
 
   if (t->s_scrambled_pass)
     return;
 
+  /* nowosc (#2): ca_hints moze byc w tym momencie przeladowywane */
+  tvh_mutex_lock(&ca_hints_mutex);
   if (!t->s_dvb_forcecaid) {
 
-    count = 0;
     TAILQ_FOREACH(st, &t->s_components.set_filter, es_filter_link)
       LIST_FOREACH(ca, &st->es_caids, link) {
         if (ca->use == 0) continue;
@@ -471,10 +750,6 @@ descrambler_service_start ( service_t *t )
         count++;
       }
 
-    /* Do not run descrambler on FTA channels */
-    if (count == 0)
-      return;
-
   } else {
 
     TAILQ_FOREACH(hint, &ca_hints, dh_link) {
@@ -487,6 +762,11 @@ descrambler_service_start ( service_t *t )
     }
 
   }
+  tvh_mutex_unlock(&ca_hints_mutex);
+
+  /* Do not run descrambler on FTA channels */
+  if (!t->s_dvb_forcecaid && count == 0)
+    return;
 
   /*
    * bugfix: brak jawnego standby_age per-CAID -> domyslnie rownamy go do
@@ -613,6 +893,47 @@ descrambler_notify_nokey( th_descrambler_runtime_t *dr )
   descrambler_notify_deliver(t, di);
 }
 
+/*
+ * nowosc (#3): jednolinijkowe podsumowanie metryk wszystkich czytnikow
+ * danej uslugi. Wolane przy parkowaniu czytnika i co kilkanascie ECM.
+ * why - krotki powod (np. "periodic", "parked").
+ */
+static void
+descrambler_reader_stats_dump ( service_t *t, const char *why )
+{
+  th_descrambler_t *td;
+
+  LIST_FOREACH(td, &t->s_descramblers, td_service_link) {
+    if (td->td_ecm_count == 0 && td->td_ecm_nok == 0)
+      continue;
+    tvhinfo(LS_DESCRAMBLER,
+            "reader stats (%s) \"%s\": %s ok=%u nok=%u ecmtime min/avg/max/last=%u/%u/%u/%u ms%s",
+            why, t->s_nicename, td->td_nicename,
+            td->td_ecm_count, td->td_ecm_nok,
+            td->td_ecm_time_min,
+            td->td_ecm_count ? (uint32_t)(td->td_ecm_time_sum / td->td_ecm_count) : 0,
+            td->td_ecm_time_max, td->td_ecm_time_last,
+            td->td_keystate == DS_RESOLVED ? " [active]" :
+              (td->td_keystate == DS_FORBIDDEN ? " [denied]" : ""));
+  }
+}
+
+/*
+ * nowosc (#3): zapisz jedna udana odpowiedz ECM dla czytnika td.
+ * Wolane pod t->s_stream_mutex.
+ */
+static void
+descrambler_reader_stat_ecm ( th_descrambler_t *td, uint32_t ecmtime )
+{
+  if (td->td_ecm_time_min == 0 || ecmtime < td->td_ecm_time_min)
+    td->td_ecm_time_min = ecmtime;
+  if (ecmtime > td->td_ecm_time_max)
+    td->td_ecm_time_max = ecmtime;
+  td->td_ecm_time_last = ecmtime;
+  td->td_ecm_time_sum += ecmtime;
+  td->td_ecm_count++;
+}
+
 void
 descrambler_notify( th_descrambler_t *td,
                     uint16_t caid, uint32_t provid,
@@ -629,6 +950,14 @@ descrambler_notify( th_descrambler_t *td,
          t->s_dvb_svcname, caid, cardsystem, provid,
          ecmtime, hops, reader, from, protocol,
          t->s_descrambler != td ? " (inactive)" : "");
+
+  /* nowosc (#3): licz metryki dla KAZDEGO czytnika, tez nieaktywnego -
+     o to wlasnie chodzi (porownanie serwerow). */
+  tvh_mutex_lock(&t->s_stream_mutex);
+  descrambler_reader_stat_ecm(td, ecmtime);
+  if (((td->td_ecm_count + td->td_ecm_nok) & 15) == 0)
+    descrambler_reader_stats_dump((service_t *)t, "periodic");
+  tvh_mutex_unlock(&t->s_stream_mutex);
 
   if (t->s_descrambler != td)
     return;
@@ -702,6 +1031,8 @@ descrambler_change_keystate( th_descrambler_t *td, th_descrambler_keystate_t key
                            descrambler_keystate2str(td->td_keystate),
                            descrambler_keystate2str(keystate),
                            t->s_nicename);
+  if (keystate == DS_FORBIDDEN)
+    td->td_ecm_nok++;   /* nowosc (#3): metryka "access denied" per czytnik */
   td->td_keystate = keystate;
   if (t == NULL || (dr = t->s_descramble) == NULL)
     return;
@@ -846,11 +1177,28 @@ cont:
         td->td_standby_valid |= 2;
       }
       td->td_standby_time = mclk();
-      descrambler_change_keystate(td, DS_IDLE, 0);
-      if (td->td_ecm_idle) {
-        tvh_mutex_unlock(&t->s_stream_mutex);
-        td->td_ecm_idle(td);
-        tvh_mutex_lock(&t->s_stream_mutex);
+      /*
+       * nowosc (#1): w trybie wyscigu ECM NIE usypiamy tego czytnika -
+       * zostaje "cieply" (DS_READY), dalej podaza za zmianami ECM i przy
+       * kazdym kluczu odswieza powyzszy cache standby. Dzieki temu
+       * failover ma zawsze swiezy zapas z niezaleznego serwera. W trybie
+       * domyslnym czytnik idzie w DS_IDLE (td_ecm_idle) jak dotychczas.
+       */
+      if (ecm_race_enabled()) {
+        if (td->td_keystate != DS_READY) {
+          tvhinfo(LS_DESCRAMBLER,
+                  "ECM race: keeping reader %s warm for service \"%s\" "
+                  "(standby refreshed)", td->td_nicename, t->s_nicename);
+          descrambler_change_keystate(td, DS_READY, 0);
+        }
+      } else {
+        descrambler_change_keystate(td, DS_IDLE, 0);
+        descrambler_reader_stats_dump(t, "parked");
+        if (td->td_ecm_idle) {
+          tvh_mutex_unlock(&t->s_stream_mutex);
+          td->td_ecm_idle(td);
+          tvh_mutex_lock(&t->s_stream_mutex);
+        }
       }
       goto end;
     }
@@ -891,6 +1239,21 @@ cont:
   }
 
   if (changed) {
+    /*
+     * nowosc (nowa #1 - adaptacyjny bufor descramblera): dr_queue_total w
+     * tym momencie to dokladnie tyle danych, ile naplynelo zanim TEN klucz
+     * dotarl - naturalny "znak wodny" na realne zapotrzebowanie na bufor
+     * (patrz uzycie w galezi przepelnienia w descrambler_descramble()).
+     * EWMA + margines 1.5x. Dolny prog to nadal config.descrambler_buffer
+     * ustawiony recznie - to uczenie WYLACZNIE podnosi bufor w gore, gdy
+     * kanal go realnie potrzebuje (np. wolny serwer ECM), nigdy go nie
+     * zmniejsza ponizej skonfigurowanej wartosci.
+     */
+    if (config.descrambler_buffer_adaptive) {
+      uint32_t watermark = ((dr->dr_queue_total / 188) * 3) / 2;
+      dr->dr_adaptive_buflen = dr->dr_adaptive_buflen ?
+        (dr->dr_adaptive_buflen * 3 + watermark) / 4 : watermark;
+    }
     descrambler_data_add_key(dr, tk, changed, insert);
     if (td->td_keystate != DS_RESOLVED)
       tvhdebug(LS_DESCRAMBLER,
@@ -959,9 +1322,11 @@ descrambler_flush_table_data( service_t *t )
   tvh_mutex_unlock(&mux->mm_descrambler_lock);
 }
 
-static inline void 
-key_update( service_t *t, th_descrambler_key_t *tk, uint8_t key, int64_t timestamp )
+static inline void
+key_update( th_descrambler_runtime_t *dr, service_t *t, th_descrambler_key_t *tk, uint8_t key, int64_t timestamp )
 {
+  int64_t new_margin;
+
   /* set the even (0) or odd (0x40) key index */
   tk->key_index = key & 0x40;
   if (tk->key_start) {
@@ -970,6 +1335,23 @@ key_update( service_t *t, th_descrambler_key_t *tk, uint8_t key, int64_t timesta
       tk->key_interval = tk->key_start + sec2mono(50) < timestamp ?
                          tk->key_initial_interval : MAX(5000000, timestamp - tk->key_start);
       tvhtrace(LS_DESCRAMBLER, "update key[%d] interval for \"%s\" to %ldms", tk->key_pid, t->s_nicename, (long)(tk->key_interval / 1000));
+      /*
+       * nowosc (nowa #3 - adaptacyjny margines ECM / "pre-roll"): TVH nie
+       * moze poprosic nadawcy o wczesniejsze ECM - to nadawca decyduje,
+       * kiedy wysyla sekcje ECM dla kolejnego okresu kryptograficznego.
+       * To, co MOZEMY zrobic, to trzymac tolerancje czasowa uzywana do
+       * wykrywania "spoznionego" klucza (dr_ecm_key_margin, patrz
+       * key_changed()/key_late()) dopasowana do REALNEGO rytmu tego
+       * kanalu, a nie do statycznej wartosci "interval/5" z pliku
+       * podpowiedzi zamrozonej raz przy starcie uslugi. tk->key_interval
+       * powyzej juz sledzi rzeczywisty odstep miedzy rotacjami - margines
+       * plynnie (EWMA) za nim podaza. Ograniczony do [1s, interval/3],
+       * zeby pojedynczy szumowy pomiar nie rozregulowal wykrywania
+       * spoznionego klucza.
+       */
+      new_margin = MINMAX(tk->key_interval / 5, sec2mono(1), tk->key_interval / 3);
+      dr->dr_ecm_key_margin = dr->dr_ecm_key_margin ?
+        (dr->dr_ecm_key_margin * 3 + new_margin) / 4 : new_margin;
     }
     tk->key_start = timestamp;
   } else {
@@ -1329,7 +1711,7 @@ descrambler_descramble ( service_t *t,
                 goto queue;
               }
             }
-            key_update(t, tk, ki, dd->dd_timestamp);
+            key_update(dr, t, tk, ki, dd->dd_timestamp);
           }
         }
 doit:
@@ -1338,8 +1720,10 @@ doit:
         tk->key_csa.csa_descramble(&tk->key_csa, (mpegts_service_t *)t, tsb2, len3);
         dr->dr_key_last = tk;
       }
-      if (len2 == 0)
+      if (len2 == 0) {
         service_reset_streaming_status_flags(t, TSS_NO_ACCESS);
+        dr->dr_ok_time = mclk();   /* nowosc (#4): wyjscie zyje */
+      }
 dd_destroy:
       descrambler_data_destroy(dr, dd, 0);
     }
@@ -1376,6 +1760,7 @@ dd_destroy:
     tk->key_csa.csa_descramble(&tk->key_csa, (mpegts_service_t *)t, tsb, len);
     dr->dr_key_last = tk;
     service_reset_streaming_status_flags(t, TSS_NO_ACCESS);
+    dr->dr_ok_time = mclk();   /* nowosc (#4): wyjscie zyje */
     return 1;
   }
 next:
@@ -1401,7 +1786,7 @@ next:
             tvhtrace(LS_DESCRAMBLER, "initial stream key[%d] set to %s for service \"%s\"",
                                     tk->key_pid, (ki & 0x40) ? "odd" : "even",
                                     ((mpegts_service_t *)t)->s_dvb_svcname);
-            key_update(t, tk, ki, mclk());
+            key_update(dr, t, tk, ki, mclk());
             break;
           } else {
             descrambler_data_cut(dr, 188);
@@ -1411,7 +1796,7 @@ next:
         tvhtrace(LS_DESCRAMBLER, "stream key[%d] changed to %s for service \"%s\"",
                                 tk->key_pid, (ki & 0x40) ? "odd" : "even",
                                 ((mpegts_service_t *)t)->s_dvb_svcname);
-        key_update(t, tk, ki, mclk());
+        key_update(dr, t, tk, ki, mclk());
       }
     }
 queue:
@@ -1421,6 +1806,11 @@ queue:
        * streaming faster.
        */
       dbuflen = MAX(300, config.descrambler_buffer);
+      if (config.descrambler_buffer_adaptive && dr->dr_adaptive_buflen > dbuflen)
+        /* nowosc (nowa #1): pozwol wyuczonemu bufor rosnac ponad prog
+           skonfigurowany recznie, ale ograniczony do 4x - zeby jeden
+           wyjatkowo wolny ECM nie napompowal pamieci bez limitu */
+        dbuflen = MIN(dr->dr_adaptive_buflen, dbuflen * 4);
       if (dr->dr_queue_total >= dbuflen * 188) {
         descrambler_data_cut(dr, MAX((dbuflen / 10) * 188, len));
         if (dr->dr_last_err + sec2mono(10) < mclk()) {
@@ -1430,6 +1820,29 @@ queue:
         } else {
           tvhtrace(LS_DESCRAMBLER, "cannot decode packets for service \"%s\"",
                    ((mpegts_service_t *)t)->s_dvb_svcname);
+        }
+        /*
+         * nowosc (#4 - dozorca wyjscia): wejscie sypie danymi (bufor
+         * pelny), ale wyjscie stoi. Jesli juz kiedys dekodowalismy
+         * (dr_ok_time != 0) i cisza trwa dluzej niz 2x interval (min 3s),
+         * sprobuj NIE-DESTRUKCYJNEJ promocji swiezego standby z innego
+         * czytnika - zamiast biernie czekac az aktywny czytnik sam
+         * dokonczy nowy cykl ECM. Rate limit 5s. Gdy nie ma czego
+         * promowac, swiadomie nic wiecej nie robimy (nie ruszamy waznych
+         * kluczy - to bylo zrodlem regresji przy pierwszej wersji).
+         */
+        now = mclk();
+        if (dr->dr_ok_time &&
+            dr->dr_ok_time + MAX(sec2mono(3), dr->dr_keys[0].key_interval * 2) < now &&
+            dr->dr_watchdog_last + sec2mono(5) < now) {
+          dr->dr_watchdog_last = now;
+          tvhwarn(LS_DESCRAMBLER,
+                  "output stalled ~%"PRId64"ms for service \"%s\", trying standby failover",
+                  mono2ms(now - dr->dr_ok_time),
+                  ((mpegts_service_t *)t)->s_dvb_svcname);
+          tvh_mutex_unlock(&t->s_stream_mutex);
+          descrambler_standby_promote(t, dr);
+          tvh_mutex_lock(&t->s_stream_mutex);
         }
       }
       descrambler_data_append(dr, tsb, len);

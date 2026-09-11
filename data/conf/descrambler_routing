@@ -1,0 +1,33 @@
+{
+  "route_comment": [
+    "",
+    "Optional CA reader routing (nowa #2). Empty by default - Tvheadend",
+    "queries every ENABLED CA client for every scrambled service, exactly",
+    "like before this file existed.",
+    "",
+    "Add entries to the \"route\" list below to restrict which configured",
+    "CA clients (by their Title/Name in Configuration -> Conditional",
+    "Access) are even TRIED for services carrying a given CAID. Useful",
+    "when several card-sharing servers only cover some CAIDs, or when a",
+    "server limits you to one concurrent stream and querying it for CAIDs",
+    "it can't decode anyway just causes collisions (\"Already has a key",
+    "for service\" / NOK).",
+    "",
+    "caid   - CAID (hexadecimal)",
+    "mask   - CAID mask (hexadecimal - use FFFF for a single CAID)",
+    "allow  - comma-separated list of CA client names. If set, ONLY these",
+    "         clients are started for services carrying this CAID.",
+    "deny   - comma-separated list of CA client names to exclude. Only",
+    "         used when \"allow\" is not set on the same rule.",
+    "",
+    "This file is hot-reloaded (checked every ~15s), same as",
+    "\"descrambler\" - no restart needed, just re-tune affected channels",
+    "for the new rule to take effect.",
+    "",
+    "Example (commented out):",
+    "  { \"caid\": \"1884\", \"mask\": \"FFFF\", \"allow\": \"testowy,s2.skyhd1\" }",
+    "  { \"caid\": \"1861\", \"mask\": \"FFFF\", \"deny\": \"s1.skyhd1\" }"
+  ],
+  "route": [
+  ]
+}

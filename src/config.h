@@ -63,9 +63,17 @@ typedef struct config {
   uint32_t cookie_expires;
   int dscp;
   uint32_t descrambler_buffer;
+  int descrambler_buffer_adaptive; /* nowosc (nowa #1): ucz sie realnego zapotrzebowania na bufor per usluga */
+  int descrambler_ecm_race;   /* nowosc (#1): trzymaj wszystkie czytniki CA "cieple" (wyscig ECM) */
   int caclient_ui;
+  int mpegts_quality_ranking; /* nowosc (nowa #1 ogolna): auto-ranking tunerow po jakosci sygnalu */
   int parser_backlog;
   int auto_clear_input_counters;
+  /* nowosc (nowa #5): okresowy backup calego katalogu konfiguracji */
+  int backup_periodic_enabled;
+  char *backup_periodic_path;
+  uint32_t backup_periodic_hours;
+  uint32_t backup_periodic_keep;
   int epg_compress;
   uint32_t epg_cut_window;
   uint32_t epg_update_window;
@@ -96,6 +104,12 @@ void config_boot
   ( const char *path, gid_t gid, uid_t uid, const char *http_user_agent );
 void config_init( int backup );
 void config_done( void );
+/* nowosc (nowa #5): niezalezny od config_init/done cykl okresowego backupu
+   (patrz config.c) - wolany osobno z main.c, zeby brak backupu nigdy nie
+   mogl zablokowac/zabic startu (w przeciwienstwie do jednorazowego
+   backupu migracyjnego przy zmianie wersji, ktory na bledzie konczy proces). */
+void config_backup_periodic_init( void );
+void config_backup_periodic_done( void );
 
 const char *config_get_server_name ( void );
 const char *config_get_http_server_name ( void );
