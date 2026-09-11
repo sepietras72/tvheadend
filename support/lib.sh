@@ -40,6 +40,21 @@
 [ -z "$ARCH" ] && ARCH=$(uname -m)
 if [ -z "$CODENAME" ]; then
   CODENAME=$(lsb_release -irs 2> /dev/null)
+  # bugfix: prekompilowane biblioteki (ffmpeg itd.) na pcloud tvheadend
+  # sa dla Debiana/Ubuntu wrzucane w katalogach nazwanych CODENAME-em
+  # suity (trixie, bookworm, noble, ...), nie "Distributor Release".
+  # Po wydaniu Debiana 13 `lsb_release -irs` zwraca "Debian 13" zamiast
+  # dawnego "trixie" (gdy trixie bylo testingiem) -> katalog na pcloud
+  # nie istnieje ("Folder name 'Debian 13' not found"), pobranie pada
+  # i build spada na kompilacje ffmpeg ze zrodel. Autobuild/identify-os.sh
+  # juz uzywa `lsb_release -c`; robimy to samo tutaj dla debian/ubuntu.
+  case " $(. /etc/os-release 2> /dev/null; echo "$ID $ID_LIKE") " in
+    *" debian "*|*" ubuntu "*)
+      _cn=$(lsb_release -cs 2> /dev/null)
+      [ -z "$_cn" ] && _cn=$(. /etc/os-release 2> /dev/null; echo "$VERSION_CODENAME")
+      case "$_cn" in ""|n/a) ;; *) CODENAME="$_cn" ;; esac
+      ;;
+  esac
   if [ -z "$CODENAME" -a -f /etc/lsb-release ]; then
     . /etc/lsb-release
     CODENAME=${DISTRIB_CODENAME}
