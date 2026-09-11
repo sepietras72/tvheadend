@@ -426,6 +426,11 @@ mpegts_service_enlist_raw
     } else {
       w = mi->mi_get_weight(mi, mmi->mmi_mux, flags, weight);
       p = mi->mi_get_priority(mi, mmi->mmi_mux, flags);
+      /* nowosc (nowa #1 ogolna): drobna, ograniczona korekta w dol za
+         niedawno obserwowane bledy cc/unc na TEJ parze (tuner, mux) -
+         patrz mpegts_mux_instance_quality_penalty(). Nigdy nie dotyka
+         "forced" p=-1 powyzej (juz nastrojony mux). */
+      p -= mpegts_mux_instance_quality_penalty(mmi);
       if (w > 0 && mi->mi_free_weight &&
           weight >= mi->mi_free_weight && w < mi->mi_free_weight)
         w = 0;

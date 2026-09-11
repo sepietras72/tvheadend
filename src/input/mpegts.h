@@ -658,6 +658,20 @@ struct mpegts_mux_instance
 
   int             mmi_start_weight;
   int             mmi_tune_failed;
+
+  /*
+   * nowosc (nowa #1 ogolna - auto-ranking tunerow po jakosci): licznik
+   * bledow (cc/unc z tii_stats) jest CALOSCIOWY (rosnie przez cale zycie
+   * tego mmi) - tutaj trzymamy ostatnio odczytana wartosc, zeby liczyc
+   * DELTE per probka (patrz mpegts_input_status_timer()), oraz EWMA
+   * "kary" wyliczonej z tych delt (x32 dla precyzji calkowitoliczbowej).
+   * Zerowane tylko przez restart procesu (celowo - to ma byc "ostatnie
+   * zachowanie", nie trwala historia). Uzycie: mpegts_mux_instance_quality_penalty().
+   */
+  int64_t         mmi_quality_cc_prev;
+  int64_t         mmi_quality_unc_prev;
+  int             mmi_quality_score;
+  int             mmi_quality_samples;
 };
 
 struct mpegts_mux_sub
@@ -1012,6 +1026,15 @@ int mpegts_input_get_weight ( mpegts_input_t *mi, mpegts_mux_t *mm, int flags, i
 int mpegts_input_get_priority ( mpegts_input_t *mi, mpegts_mux_t *mm, int flags );
 int mpegts_input_get_grace ( mpegts_input_t *mi, mpegts_mux_t *mm );
 int mpegts_input_warm_mux ( mpegts_input_t *mi, mpegts_mux_instance_t *mmi );
+
+/*
+ * nowosc (nowa #1 ogolna): jak bardzo (w jednostkach priorytetu, mala,
+ * ograniczona wartosc) obnizyc priorytet TEGO konkretnego (tuner, mux)
+ * ze wzgledu na niedawno obserwowane bledy cc/unc. 0, gdy funkcja
+ * wylaczona (config.mpegts_quality_ranking) albo za malo probek jeszcze
+ * zebrano. Patrz mpegts_service.c (mpegts_service_enlist_raw).
+ */
+int mpegts_mux_instance_quality_penalty ( mpegts_mux_instance_t *mmi );
 
 void mpegts_input_save ( mpegts_input_t *mi, htsmsg_t *c );
 

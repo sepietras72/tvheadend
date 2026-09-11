@@ -23,6 +23,7 @@
 #include "notify.h"
 #include "dbus.h"
 #include "memoryinfo.h"
+#include "config.h"
 
 memoryinfo_t mpegts_input_queue_memoryinfo = { .my_name = "MPEG-TS input queue" };
 memoryinfo_t mpegts_input_table_memoryinfo = { .my_name = "MPEG-TS table queue" };
@@ -2030,6 +2031,57 @@ mpegts_input_thread_stop ( mpegts_input_t *mi )
  * Status monitoring
  * *************************************************************************/
 
+#define MMI_QUALITY_MIN_SAMPLES  10   /* nie ufaj pojedynczej/kilku probkom */
+#define MMI_QUALITY_MAX_PENALTY   3   /* mala, ograniczona korekta priorytetu */
+
+/*
+ * nowosc (nowa #1 ogolna - ranking tunerow po jakosci): wolane raz na
+ * sekunde (razem z reszta tego timera) dla kazdego AKTYWNEGO mmi. Liczy
+ * delte bledow cc/unc od poprzedniej probki i wlicza ja (EWMA, x32 dla
+ * precyzji calkowitoliczbowej) do mmi_quality_score. cc/unc w tii_stats
+ * sa licznikami CALOSCIOWYMI (rosna przez cale zycie mmi) - stad odjecie
+ * poprzedniej wartosci. Ujemna delta (np. po ponownym (re)tunowaniu,
+ * ktore czesciowo zeruje liczniki na poziomie sterownika) oznacza brak
+ * sensownego pomiaru w tym cyklu - tylko przesuwamy punkt odniesienia.
+ */
+static void
+mpegts_mux_instance_update_quality
+  ( mpegts_mux_instance_t *mmi, const tvh_input_stream_stats_t *stats )
+{
+  int64_t d_cc, d_unc;
+  int badness;
+
+  if (!config.mpegts_quality_ranking)
+    return;
+
+  d_cc  = (int64_t)stats->cc  - mmi->mmi_quality_cc_prev;
+  d_unc = (int64_t)stats->unc - mmi->mmi_quality_unc_prev;
+  mmi->mmi_quality_cc_prev  = stats->cc;
+  mmi->mmi_quality_unc_prev = stats->unc;
+
+  if (mmi->mmi_quality_samples == 0 || d_cc < 0 || d_unc < 0) {
+    mmi->mmi_quality_samples = 1;
+    return;
+  }
+
+  badness = (int)MIN(d_cc, 1000) + (int)MIN(d_unc, 1000) * 4;
+  mmi->mmi_quality_score = mmi->mmi_quality_samples > 1 ?
+    (mmi->mmi_quality_score * 7 + badness * 32) / 8 : badness * 32;
+  if (mmi->mmi_quality_samples < 1000000)
+    mmi->mmi_quality_samples++;
+}
+
+int
+mpegts_mux_instance_quality_penalty ( mpegts_mux_instance_t *mmi )
+{
+  if (!config.mpegts_quality_ranking || mmi == NULL)
+    return 0;
+  if (mmi->mmi_quality_samples < MMI_QUALITY_MIN_SAMPLES)
+    return 0;
+  /* mmi_quality_score jest x32 (precyzja EWMA); >>5 cofa to skalowanie */
+  return MIN(mmi->mmi_quality_score >> 5, MMI_QUALITY_MAX_PENALTY);
+}
+
 void
 mpegts_input_status_timer ( void *p )
 {
@@ -2043,6 +2095,7 @@ mpegts_input_status_timer ( void *p )
   LIST_FOREACH(mmi, &mi->mi_mux_active, mmi_active_link) {
     memset(&st, 0, sizeof(st));
     mpegts_input_stream_status(mmi, &st);
+    mpegts_mux_instance_update_quality(mmi, &st.stats);
     e = tvh_input_stream_create_msg(&st);
     htsmsg_add_u32(e, "update", 1);
     notify_by_msg("input_status", e, 1, 0);

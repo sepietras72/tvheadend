@@ -1267,6 +1267,7 @@ main(int argc, char **argv)
   tvhftrace(LS_MAIN, spawn_init);
   tvhftrace(LS_MAIN, idnode_init);
   tvhftrace(LS_MAIN, config_init, opt_nobackup == 0);
+  tvhftrace(LS_MAIN, config_backup_periodic_init);
 
   /* Memoryinfo */
   idclass_register(&memoryinfo_class);
@@ -1463,6 +1464,7 @@ main(int argc, char **argv)
   tvhlog(LOG_NOTICE, LS_STOP, "Exiting HTS Tvheadend");
   tvhlog_end();
 
+  tvhftrace(LS_MAIN, config_backup_periodic_done);
   tvhftrace(LS_MAIN, config_done);
   tvhftrace(LS_MAIN, hts_settings_done);
 
