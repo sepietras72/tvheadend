@@ -35,8 +35,18 @@ const fmtHexId = (v: unknown) => {
   return ('0000000' + v.toString(16).toUpperCase()).slice(-8)
 }
 
+/*
+ * bugfix: `in`/`out` from api/status/subscriptions are BYTES/sec (see
+ * subscriptions.c:1094-1097, ths_bytes_in_avg/ths_bytes_out_avg - a raw
+ * 1-second byte delta), not bits/sec. This used to divide by 1024,
+ * which is neither a bytes->KB nor a bytes->kilobit conversion - it
+ * under-reported the "Input/Output (kb/s)" columns by a factor of
+ * ~8.2x (1024/125). Classic's equivalent renderer (status.js:75,
+ * `value / 125`) already does this correctly: bytes/s * 8 / 1000 ==
+ * bytes/s / 125. Match it so both UIs show the same number.
+ */
 const fmtKbps = (v: unknown) =>
-  typeof v === 'number' ? Math.round(v / 1024).toString() : ''
+  typeof v === 'number' ? Math.round((v * 8) / 1000).toString() : ''
 
 const fmtPids = (v: unknown) => {
   if (!Array.isArray(v) || v.length === 0) return ''
