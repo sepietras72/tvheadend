@@ -1538,6 +1538,7 @@ dobackup(const char *oldver)
   const char **arg;
   pid_t pid;
   int code;
+  int in_root = 0; /* bugfix: patrz komentarz przy "fatal:" ponizej */
 
   assert(root);
 
@@ -1567,6 +1568,7 @@ dobackup(const char *oldver)
     tvherror(LS_CONFIG, "unable to find directory '%s'", root);
     goto fatal;
   }
+  in_root = 1;
 
   snprintf(outfile, sizeof(outfile), "%s/backup/%s.tar.bz2",
                                      root, oldver);
@@ -1610,8 +1612,27 @@ dobackup(const char *oldver)
   return;
 
 fatal:
-  tvherror(LS_CONFIG, "backup: fatal error");
-  exit(EXIT_FAILURE);
+  /*
+   * bugfix: to byl exit(EXIT_FAILURE) - kazdy nieudany backup
+   * migracyjny (np. "tar" zabity sygnalem, bo caly proces tvheadend
+   * dostal w tej samej chwili SIGTERM od restartu/stopu z zewnatrz -
+   * patrz "Child died with signal 15" / "Broken pipe" w logu) ubijal
+   * CALY serwer, mimo ze linijka nizej w tej samej funkcji mowi "please
+   * DON'T report this as an error, you may use --nobackup to skip" -
+   * czyli sam kod juz zaklada, ze to nie powinno byc traktowane jako
+   * fatalne. Im wiecej skonfigurowanych serwerow/kanalow/EPG, tym
+   * dluzej dziala tar, tym wieksze okno na taki zbieg okolicznosci -
+   * a poniewaz przy exit(1) wersja configu nigdy sie nie zapisywala,
+   * KOLEJNY start probowal ten sam backup migracyjny od nowa - petla
+   * restart/crash az do przypadkowego udanego przebiegu. Traktujemy
+   * nieudany backup migracyjny tak samo jak periodyczny w tle
+   * (config_backup_periodic_run() ponizej) - logujemy i kontynuujemy
+   * start BEZ tego backupu, zamiast zabijac caly proces.
+   */
+  tvherror(LS_CONFIG, "backup: fatal error, continuing startup without it");
+  if (in_root && chdir(cwd))
+    tvherror(LS_CONFIG, "unable to change directory back to '%s': %s",
+             cwd, strerror(errno));
 }
 
 /*

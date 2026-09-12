@@ -587,7 +587,22 @@ descrambler_init ( void )
 void
 descrambler_done ( void )
 {
+  /*
+   * bugfix: mtimer_disarm() wymaga trzymania global_lock ("the
+   * global_lock must be held" - main.c) - asercja lock_assert()
+   * wewnatrz niego wywoluje abort() gdy lock nie jest trzymany. main()
+   * wola descrambler_done() w sekwencji zamykania BEZ global_lock (patrz
+   * sasiednie wywolania w main.c - global_lock jest tam trzymany tylko
+   * lokalnie wokol epg_save()/timeshift_term()) - bez tej blokady KAZDE
+   * czyste zatrzymanie/restart tvheadend konczylo sie SIGABRT zamiast
+   * normalnego wylaczenia (patrz ca_hints_reload_timer, dodany razem z
+   * timerem "hint hot-reload" - ten blad istnial od tamtej zmiany, po
+   * prostu nikt wczesniej nie zatrzymal czysto zbudowanej binarki, zeby
+   * to zobaczyc).
+   */
+  tvh_mutex_lock(&global_lock);
   mtimer_disarm(&ca_hints_reload_timer);
+  tvh_mutex_unlock(&global_lock);
   caclient_done();
   tvh_mutex_lock(&ca_hints_mutex);
   descrambler_clear_hints();
@@ -1029,6 +1044,17 @@ descrambler_notify( th_descrambler_t *td,
   /* nowosc (#3): licz metryki dla KAZDEGO czytnika, tez nieaktywnego -
      o to wlasnie chodzi (porownanie serwerow). */
   tvh_mutex_lock(&t->s_stream_mutex);
+  /*
+   * bugfix: td_caid ustawiany byl tylko raz, przy starcie readera
+   * (zgadywany dla capmt/capmt2 jako "pierwszy CAID z PMT" - patrz
+   * komentarz w CaReadersView.vue - a dla cccam/cwc jako CAID karty
+   * wybranej przy cc_service_start()). Tutaj mamy PRAWDZIWY, aktualnie
+   * uzywany CAID z kazdego udanego ECM (dla capmt2 wprost z komunikatu
+   * OSCam ECM_INFO) - nadpisujemy nim, wiec Status -> CA Readers i
+   * Subscriptions pokazuja teraz ten sam, prawdziwy CAID zamiast
+   * rozjezdzajacej sie zgadywanki.
+   */
+  td->td_caid = caid;
   descrambler_reader_stat_ecm(td, ecmtime);
   if (((td->td_ecm_count + td->td_ecm_nok) & 15) == 0)
     descrambler_reader_stats_dump((service_t *)t, "periodic");

@@ -42,6 +42,15 @@
  */
 #define CC_ECM_PENDING_TIMEOUT sec2mono(5)
 
+/*
+ * nowosc: po tylu ponowieniach TEGO SAMEGO zadania ECM bez ZADNEJ
+ * odpowiedzi (patrz es_silent_retries) uznajemy, ze wybrany CAID nie
+ * dziala u tego dostawcy i probujemy inny (cc_try_alt_caid()) - patrz
+ * cc_table_input(). 3 probki * 5s (CC_ECM_PENDING_TIMEOUT) = ok. 15s
+ * calkowitej ciszy, zanim poddamy sie na tym CAID-zie.
+ */
+#define CC_MAX_SILENT_RETRIES 3
+
 /**
  *
  */
@@ -69,6 +78,29 @@ typedef struct cc_ecm_section {
   uint8_t  es_pending;
   uint8_t  es_resolved;
   int64_t  es_time;  // time request was sent
+
+  /*
+   * nowosc: ile kolejnych wyslanych zadan ECM dla tej sekcji z rzedu
+   * zostalo BEZ ZADNEJ odpowiedzi (ani klucza, ani NOK) - patrz
+   * cc_table_input(). Rosnie w dwoch miejscach tam: (1) gdy ponawiamy
+   * TO SAMO (identyczne) zadanie po CC_ECM_PENDING_TIMEOUT bez
+   * odpowiedzi, oraz (2) - to jest ten typowy w realnym DVB przypadek -
+   * gdy tresc ECM zdazyla sie juz naturalnie zmienic (kolejny okres
+   * kryptograficzny) zanim poprzednie zadanie w ogole dostalo
+   * odpowiedz; bez (2) calkowicie milczacy CAID nigdy nie zostalby
+   * wykryty, bo descrambler_table_callback() (descrambler.c) i tak
+   * przekazuje tutaj tylko ZMIENIONA tresc, wiec galaz (1) w praktyce
+   * prawie nigdy by sie nie uruchomila. To inny scenariusz niz "access
+   * denied" w cc_ecm_reply() (tam serwer PRZYNAJMNIEJ odpowiada, tylko
+   * odmawia) - tutaj serwer milczy calkowicie. Po CC_MAX_SILENT_RETRIES
+   * probach bez zadnej odpowiedzi (z dowolnego z tych dwoch zrodel)
+   * traktujemy to jako rownowazny dowod, ze ten CAID nie dziala u tego
+   * dostawcy, i probujemy cc_try_alt_caid() - bez tego reader potrafil
+   * utknac w kolko powtarzajac to samo, nigdy nieodpowiadajace CAID w
+   * nieskonczonosc. Zerowane w cc_ecm_reply() przy KAZDEJ odpowiedzi
+   * (nawet NOK - to juz dowod, ze polaczenie/CAID zyje).
+   */
+  uint8_t  es_silent_retries;
 
 } cc_ecm_section_t;
 

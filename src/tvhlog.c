@@ -148,6 +148,7 @@ tvhlog_subsys_t tvhlog_subsystems[] = {
   [LS_CAPMT2]        = { "capmt2",        N_("CAPMT2 CA Client (OSCam, incremental)") },
   [LS_CWC]           = { "cwc",           N_("CWC CA Client") },
   [LS_CCCAM]         = { "cccam",         N_("CWC CCCam Client") },
+  [LS_CCCAM2]        = { "cccam2",        N_("CCcam2 CA Client (OSCam-compatible rewrite)") },
   [LS_DVBCAM]        = { "dvbcam",        N_("DVB CAM Client") },
   [LS_DVR]           = { "dvr",           N_("Digital Video Recorder") },
   [LS_DVR_INOTIFY]   = { "dvr-inotify",   N_("DVR Inotify") },

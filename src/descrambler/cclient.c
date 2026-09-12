@@ -24,6 +24,7 @@
 #include "tcp.h"
 #include "cclient.h"
 #include "tvhpoll.h"
+#include "config.h" /* config.descrambler_ecm_race - patrz cc_ecm_reply() */
 
 /*
  *
@@ -456,6 +457,10 @@ cc_ecm_reply(cc_service_t *ct, cc_ecm_section_t *es,
   int64_t delay = (getfastmonoclock() - es->es_time) / 1000LL; // in ms
 
   es->es_pending = 0;
+  /* nowosc: doszla JAKAKOLWIEK odpowiedz (klucz albo NOK) - CAID/
+   * polaczenie zyje, wyzeruj licznik "calkowitej ciszy" (patrz
+   * es_silent_retries w cclient.h) */
+  es->es_silent_retries = 0;
 
   snprintf(chaninfo, sizeof(chaninfo), " (PID %d CAID %04X)", es->es_capid, es->es_caid);
 
@@ -521,6 +526,42 @@ cc_ecm_reply(cc_service_t *ct, cc_ecm_section_t *es,
       snprintf(((th_descrambler_t *)ct)->td_ecm_last_error,
                sizeof(((th_descrambler_t *)ct)->td_ecm_last_error),
                "NOK: already has a key for service");
+      /*
+       * bugfix: przy wlaczonym wyscigu ECM (config.descrambler_ecm_race)
+       * ten reader MA zostac "cieply" i dalej aktywnie dopytywac o ECM -
+       * dokladnie tak samo, jak juz to robi descrambler.c/descrambler_keys()
+       * dla analogicznego przypadku "inny reader juz ma klucz" (tam
+       * zostaje DS_READY zamiast DS_IDLE). Ustawienie tutaj es_keystate
+       * na ES_IDLE (raz na zawsze, bo es przezywa cale zycie PID-u/sekcji,
+       * patrz cc_table_input()) i zejscie ct do DS_IDLE calkowicie
+       * ubijalo ten failover: skoro AKTYWNY reader (np. wolniejszy serwer)
+       * kiedykolwiek dostal explicit NOK "already has a key" (np. bo w
+       * momencie wyslania inny reader byl juz DS_RESOLVED), ten reader
+       * przestawal wysylac ECM NA ZAWSZE dla tej sekcji/PID-u (dalszy
+       * przeplyw ponizej i tak konczyl sie w "forbid:", ktore rowniez
+       * ustawia trwaly ES_FORBIDDEN) - nawet gdy pozniej "szybszy" reader
+       * padnie/spowolni, nie ma juz nikogo, kto mialby swiezy klucz do
+       * przejecia. Trzeba wiec wrocic PRZED "forbid:", nie tylko pominac
+       * ES_IDLE. Bez wyscigu ECM zachowanie zostaje jak dawniej
+       * (oszczedzanie polaczenia backupowego - trwaly stan spoczynku).
+       */
+      if (config.descrambler_ecm_race) {
+        /*
+         * "already has a key" nie jest dowodem, ze CAID/karta nie dziala -
+         * nie moze wiec liczyc sie do es_nok (inkrementowanego na samej
+         * gorze tej funkcji dla KAZDEGO NOK-a), bo po CC_MAX_NOKS takich
+         * odpowiedzi z rzedu wczesniejsza galaz w tej funkcji
+         * ("if (es->es_nok >= CC_MAX_NOKS)") i tak wymusi trwaly
+         * ES_FORBIDDEN, dokladnie ten sam problem co ES_IDLE ponizej.
+         */
+        if (es->es_nok)
+          es->es_nok--;
+        tvhdebug(cc->cc_subsys,
+                 "%s: ECM race: keeping %s warm despite \"already has a "
+                 "key\" for service \"%s\"",
+                 cc->cc_name, ct->td_nicename, t->s_dvb_svcname);
+        return;
+      }
       es->es_nok = CC_MAX_NOKS; /* do not send more ECM requests */
       es->es_keystate = ES_IDLE;
       if (ct->td_keystate == DS_READY)
@@ -1115,6 +1156,35 @@ found:
       es = calloc(1, sizeof(cc_ecm_section_t));
       es->es_section = section;
       LIST_INSERT_HEAD(&ep->ep_sections, es, es_link);
+    } else if (es->es_pending && es->es_data_len > 0 &&
+               (es->es_data_len != len || memcmp(es->es_data, data, len) != 0) &&
+               getfastmonoclock() - es->es_time >= CC_ECM_PENDING_TIMEOUT) {
+      /*
+       * bugfix: poprzednie zadanie ECM dla TEJ SAMEJ sekcji (ale ze
+       * STAREJ, juz nieaktualnej tresci - z poprzedniego okresu
+       * kryptograficznego) nigdy nie dostalo ZADNEJ odpowiedzi, a tresc
+       * juz naturalnie sie zmienila (nadeszla kolejna, INNA tresc z
+       * nastepnego okresu). Bez tej galezi taka cisza NIGDY nie
+       * zostalaby wykryta: galaz "identyczna tresc" ponizej w ogole by
+       * sie nie uruchomila (bo tresc jest teraz inna), a
+       * descrambler_table_callback() (descrambler.c) i tak przekazuje
+       * tutaj TYLKO gdy tresc realnie sie zmienila (des->changed==2) -
+       * w normalnym nadawaniu DVB (okres kryptograficzny rotuje co
+       * ~10-12s) tresc PRAWIE ZAWSZE jest inna niz poprzednio, wiec
+       * galaz "identyczna tresc" ponizej w praktyce prawie nigdy sie nie
+       * uruchamia. Calkowicie milczacy CAID wygladalby wiec tak, jakby
+       * "normalnie" wysylal kolejne, swieze zadania co okres - w
+       * nieskonczonosc, nigdy nie eskalujac do innego CAID-u (patrz
+       * es_silent_retries w cclient.h).
+       */
+      tvhdebug(cc->cc_subsys,
+               "%s: previous ECM request for service \"%s\"%s never got a "
+               "reply (>%ds) despite new content - still silent",
+               cc->cc_name, t->s_dvb_svcname, chaninfo,
+               (int)(CC_ECM_PENDING_TIMEOUT / 1000000));
+      if (++es->es_silent_retries >= CC_MAX_SILENT_RETRIES &&
+          cc_try_alt_caid(ct))
+        goto end;
     }
     if (es->es_data_len == len && memcmp(es->es_data, data, len) == 0) {
       /*
@@ -1136,6 +1206,20 @@ found:
                "%s: ECM request for service \"%s\"%s never got a reply "
                "(>%ds) - retrying", cc->cc_name, t->s_dvb_svcname, chaninfo,
                (int)(CC_ECM_PENDING_TIMEOUT / 1000000));
+      /*
+       * nowosc: to nie jest "access denied" (serwer w ogole nic nie
+       * odpowiada, ani klucza, ani NOK) - taki przypadek nigdy nie
+       * trafial do cc_ecm_reply(), wiec cc_try_alt_caid() tam nigdy sie
+       * nie uruchamial i reader potrafil w nieskonczonosc powtarzac
+       * ten sam, nigdy nieodpowiadajacy CAID. Po CC_MAX_SILENT_RETRIES
+       * takich ponowieniach z rzedu traktujemy to jako rownowazny dowod
+       * ze ten CAID nie dziala i probujemy inny (patrz es_silent_retries
+       * w cclient.h). `ct`/`es` sa nieuzywalne po tym wywolaniu jesli
+       * zwrocilo 1 (mogly zostac zniszczone/przekonfigurowane).
+       */
+      if (++es->es_silent_retries >= CC_MAX_SILENT_RETRIES &&
+          cc_try_alt_caid(ct))
+        goto end;
     }
     if (es->es_data_len < len) {
       free(es->es_data);
@@ -1299,7 +1383,22 @@ cc_service_start(caclient_t *cac, service_t *t)
       if (prefpid_lock == PREFCAPID_FORCE && prefpid != st->es_pid)
         continue;
       LIST_FOREACH(c, &st->es_caids, link) {
-        if (c->use && c->caid == pcard->cs_ra.caid)
+        /*
+         * bugfix: to samo kryterium co pozniej w cc_table_input()
+         * ("found:" - LIST_FOREACH po cc_cards - patrz
+         * verify_provider() tam). Bez tego drugiego warunku ten kod
+         * mogl przypisac uslugę do CAID-u, dla ktorego serwer ma
+         * karte, ale pod INNYM provider ID niz wymaga akurat ten
+         * kanal - cc_table_input() nigdy pozniej nie zaakceptuje
+         * takiego dopasowania (bo TAM provider JEST sprawdzany), wiec
+         * ECM nigdy nie zostaje w ogole wyslane - reader zostaje
+         * trwale w DS_READY ("Warm standby"), bez zadnej proby i bez
+         * szans, zeby zadziwaly mechanizmy retry/cc_try_alt_caid()
+         * (one dzialaja dopiero PO pierwszej faktycznej probie
+         * wyslania).
+         */
+        if (c->use && c->caid == pcard->cs_ra.caid &&
+            verify_provider(pcard, c->providerid))
           if (!forcecaid || forcecaid == c->caid)
             break;
       }
@@ -1322,6 +1421,22 @@ cc_service_start(caclient_t *cac, service_t *t)
             ((mpegts_service_t *)t)->s_dvb_svcname,
             ct->td_caid, pcard->cs_ra.caid);
     ct->td_caid = pcard->cs_ra.caid;
+    /*
+     * bugfix (kosmetyczny): td_nicename byl budowany RAZ, przy tworzeniu
+     * czytnika, i zawieral ten pierwszy, wybrany CAID na stale (np.
+     * "cccam2-staff.servebeer.com:38570-1861"). Po przelaczeniu na inny
+     * CAID (ta galaz) sama nazwa nigdy sie nie odswiezala, wiec wszystkie
+     * kolejne logi (NOK, "already has a key", "keeping warm" itd.) dalej
+     * pokazywaly STARY CAID w nazwie readera, mimo ze faktycznie wysylane
+     * bylo zadanie z NOWYM CAID-em - mylace przy czytaniu logow, choc bez
+     * wplywu na dzialanie (td_caid, uzywany funkcjonalnie, byl juz
+     * poprawny). Odbudowujemy nazwe dokladnie tak samo jak przy tworzeniu
+     * czytnika ponizej.
+     */
+    free(((th_descrambler_t *)ct)->td_nicename);
+    snprintf(buf, sizeof(buf), "%s-%s-%04X",
+             cc->cc_id, cc->cc_name, pcard->cs_ra.caid);
+    ((th_descrambler_t *)ct)->td_nicename = strdup(buf);
     ct->ecm_state = ECM_INIT;
     descrambler_change_keystate((th_descrambler_t *)ct, DS_READY, 0);
   }
@@ -1378,7 +1493,12 @@ add:
   mpegts_pid_init(&epids);
   TAILQ_FOREACH(st, &t->s_components.set_filter, es_filter_link) {
     LIST_FOREACH(c, &st->es_caids, link)
-      if (c->use && c->caid == pcard->cs_ra.caid)
+      /* bugfix: patrz komentarz przy pierwszym uzyciu verify_provider()
+       * powyzej - jesli usluga ma ten sam CAID pod kilkoma provider ID
+       * (rzadkie, ale mozliwe), nie otwierajmy pidu, ktorego
+       * cc_table_input() i tak nigdy nie zaakceptuje. */
+      if (c->use && c->caid == pcard->cs_ra.caid &&
+          verify_provider(pcard, c->providerid))
         mpegts_pid_add(&epids, st->es_pid, 0);
   }
   if (mpegts_pid_cmp(&ct->cs_epids, &epids))

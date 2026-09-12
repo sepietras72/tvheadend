@@ -148,6 +148,22 @@ typedef struct th_descrambler {
    */
   char td_ecm_last_error[80];
 
+  /*
+   * nowosc: mclk() z momentu, gdy TVH ostatni raz FAKTYCZNIE przekazal
+   * zadanie ECM do polaczenia z serwerem karty (nie tylko "postanowilismy
+   * wyslac" - patrz "Sending ECM..." w cc_table_input()/cclient.c, ktore
+   * pojawia sie ZANIM w ogole wywolamy backend - a moment, w ktorym
+   * zaszyfrowany pakiet trafil do cc_write_message()/kolejki zapisu
+   * gniazda, patrz cccam2_send_ecm() w cccam2.c). 0 = jeszcze nigdy.
+   * Widoczne w Status -> CA Readers jako "ile temu" - odpowiada na
+   * pytanie "czy TEN reader w ogole COKOLWIEK ostatnio probowal wyslac",
+   * niezaleznie od tego, czy dostal odpowiedz (ecm_last powyzej mowi
+   * tylko o UDANYCH odpowiedziach, wiec reader trwale bez odpowiedzi -
+   * np. utkniety na CAID, ktory nigdy nie odpowiada - mial tam puste
+   * pole; tutaj bedzie widac, ze mimo to regularnie probuje).
+   */
+  int64_t td_ecm_last_sent;
+
 } th_descrambler_t;
 
 typedef struct th_descrambler_key {

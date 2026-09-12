@@ -169,6 +169,20 @@ api_status_ca_readers
          biezacego bledu, ostatnia byla udana) - patrz td_ecm_last_error
          w descrambler.h */
       htsmsg_add_str(e, "last_error", td->td_ecm_last_error);
+      /*
+       * nowosc: "ile milisekund temu" TVH ostatni raz FAKTYCZNIE przekazal
+       * zadanie ECM do polaczenia z serwerem (td_ecm_last_sent,
+       * descrambler.h - ustawiane np. w cccam2_send_ecm() po udanym
+       * cccam2_send_msg()). -1 = jeszcze nigdy nic nie wyslano tym
+       * czytnikiem. W odroznieniu od ecm_last/ecm_avg (ktore mowia tylko
+       * o UDANYCH odpowiedziach) to dziala rowniez dla readera, ktory
+       * regularnie probuje, ale nigdy nie dostaje odpowiedzi (np. utkniety
+       * na CAID, ktory milczy) - bez tego taki przypadek wygladal w UI
+       * identycznie jak reader, ktory w ogole przestal cokolwiek probowac.
+       */
+      htsmsg_add_s64(e, "ecm_sent_ago",
+                     td->td_ecm_last_sent ?
+                       (int64_t)((mclk() - td->td_ecm_last_sent) / 1000LL) : -1);
       htsmsg_add_msg(l, NULL, e);
       c++;
     }

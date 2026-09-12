@@ -615,7 +615,8 @@ I18N-C += $(SRCS-CWC)
 
 # CCCAM
 SRCS-CCCAM = \
-	src/descrambler/cccam.c
+	src/descrambler/cccam.c \
+	src/descrambler/cccam2.c
 SRCS-${CONFIG_CCCAM} += $(SRCS-CCCAM)
 I18N-C += $(SRCS-CCCAM)
 

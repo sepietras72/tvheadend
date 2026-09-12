@@ -86,6 +86,20 @@ const fmtCaid = (v: unknown) =>
   typeof v === 'number' && v > 0 ? v.toString(16).toUpperCase().padStart(4, '0') : '–'
 
 /*
+ * ecm_sent_ago (td_ecm_last_sent, descrambler.h) - ms since TVH last
+ * ACTUALLY handed an ECM request to this reader's connection, -1 if
+ * never. Deliberately independent of ecm_ok/ecm_avg (which only ever
+ * reflect SUCCESSFUL replies) - this is the one column that still moves
+ * for a reader stuck on a CAID that never answers, so "still trying" is
+ * visible even when nothing has ever come back.
+ */
+const fmtSentAgo = (v: unknown) => {
+  if (typeof v !== 'number' || v < 0) return t('never')
+  if (v < 1000) return `${v} ms`
+  return `${(v / 1000).toFixed(1)} s`
+}
+
+/*
  * Phone-card layout: service as the bold headline (what you'd
  * recognise first - "which channel"), reader as the 2-up companion
  * ("which server"), ok/nok counts as the health-at-a-glance row.
@@ -141,6 +155,14 @@ const cols: ColumnDef[] = [
     minVisible: 'desktop',
     width: 220,
     format: fmtEcmTime,
+  },
+  {
+    field: 'ecm_sent_ago',
+    label: t('Last ECM Sent'),
+    sortable: true,
+    minVisible: 'desktop',
+    width: 130,
+    format: fmtSentAgo,
   },
   {
     field: 'standby_ready',

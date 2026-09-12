@@ -167,6 +167,7 @@ enum {
   LS_CAPMT2,
   LS_CWC,
   LS_CCCAM,
+  LS_CCCAM2,
   LS_DVBCAM,
   LS_DVR,
   LS_DVR_INOTIFY,
