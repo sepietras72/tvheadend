@@ -576,6 +576,7 @@ end_of_search_for_cam:
   snprintf(buf, sizeof(buf), "dvbcam-%i-%i-%04X",
            ac->ca->lca_adapnum, ac->ca->lca_slotnum, (int)as->caid_list[0]);
   td->td_nicename = strdup(buf);
+  td->td_caid = as->caid_list[0];
   td->td_service = t;
   td->td_stop = dvbcam_service_destroy;
   dr = t->s_descramble;

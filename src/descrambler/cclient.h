@@ -28,6 +28,19 @@
  */
 #define CC_KEEPALIVE_INTERVAL 30
 #define CC_MAX_NOKS           3
+/*
+ * nowosc: ile najdluzej (w mikrosekundach getfastmonoclock()) czekamy
+ * na JAKAKOLWIEK odpowiedz (klucz, NOK) dla danej sekcji ECM, zanim
+ * przestaniemy traktowac powtorke identycznej tresci jako "juz
+ * wyslane, czekaj" i sprobujemy ponownie. Dotyczy WSZYSTKICH
+ * protokolow cclient (cccam I cwc/newcamd) - patrz cc_table_input().
+ * Bez tego: jesli serwer raz zgubi/zignoruje zadanie bez odpowiedzi
+ * (a w trybie EXT nie ma ZADNEGO innego zabezpieczenia typu timeout -
+ * to nie jest to samo co busy-timeout w cccam.c, ktory dziala tylko
+ * dla nie-EXT), ta konkretna sekcja ECM zostaje trwale zawieszona az
+ * do naturalnej zmiany tresci (nastepny okres kryptograficzny).
+ */
+#define CC_ECM_PENDING_TIMEOUT sec2mono(5)
 
 /**
  *
@@ -96,6 +109,21 @@ typedef struct cc_service {
   } ecm_state;
 
   LIST_HEAD(, cc_ecm_pid) cs_ecm_pids;
+
+  /*
+   * nowosc: CAID-y, ktore juz probowalismy dla tej uslugi na TYM
+   * readerze i serwer ostatecznie odmowil dostepu (wyczerpane wszystkie
+   * sekcje ECM - patrz cc_ecm_reply() w cclient.c, galaz "access
+   * denied"). Kanaly multi-CAS czesto maja karte serwera zarejestrowana
+   * pod kilkoma CAID-ami, z ktorych tylko czesc faktycznie dziala (np.
+   * jeden CAID jest martwy/nieautoryzowany na koncie, a inny - dziala).
+   * Bez tej listy cc_service_start() zawsze wybieralby ten sam,
+   * niedzialajacy CAID w kolko. Maly staly rozmiar - to lista wyjatkow,
+   * nie ma sensu obslugiwac dziesiatek CAID-ow na jednej usludze.
+   */
+#define CC_MAX_BAD_CAID 4
+  uint16_t cs_bad_caid[CC_MAX_BAD_CAID];
+  uint8_t  cs_bad_caid_count;
 
 } cc_service_t;
 

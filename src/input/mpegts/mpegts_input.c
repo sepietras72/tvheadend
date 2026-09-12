@@ -1937,6 +1937,10 @@ mpegts_input_stream_status
       (mmi->mmi_bps_smoothed * 2 + raw) / 3 : raw;
     st->stats.bps = (int)mmi->mmi_bps_smoothed;
   }
+  /* nowosc: wynik auto-rankingu jakosci (patrz komentarz przy
+     tvh_input_stream_stats_t.quality_penalty w input.h) */
+  st->stats.quality_penalty = mpegts_mux_instance_quality_penalty(mmi);
+  st->stats.quality_samples = mmi->mmi_quality_samples;
 }
 
 void

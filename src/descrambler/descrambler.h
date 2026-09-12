@@ -59,6 +59,32 @@ typedef struct th_descrambler {
   LIST_ENTRY(th_descrambler) td_service_link;
 
   char *td_nicename;
+  /*
+   * nowosc: przyjazna nazwa KLIENTA CA (idnode "name"/Title z
+   * Configuration -> Conditional Access, z fallbackiem na "CA client %i"
+   * jak wszedzie indziej w UI - patrz idnode_get_title()). td_nicename
+   * powyzej bywa np. "capmt-192.168.168.103-9000" albo
+   * "cccam-192.168.1.1:12000-1884" - dobre do logow/debugowania (dokladny
+   * adres+port+CAID), ale nieczytelne w UI (Status -> CA Readers), gdzie
+   * admina interesuje skonfigurowana nazwa readera, nie jego adres.
+   */
+  char *td_client_name;
+
+  /*
+   * nowosc: CAID skojarzony z TYM czytnikiem, do UI (Status -> CA
+   * Readers, osobna kolumna) - td_nicename/td_client_name go nie niosa.
+   * 0 = nieznane/nieustawione.
+   *
+   * cclient.c (cccam/newcamd): jednoznaczne - jeden czytnik = jedna
+   * karta = jeden CAID (pcard->cs_ra.caid). dvbcam.c: pierwszy z
+   * negocjowanej listy. capmt.c/capmt2.c (OSCam): PIERWSZY CAID
+   * zaoferowany OSCamowi dla tej uslugi (z PMT) - dla typowej uslugi z
+   * jednym CAS-em to jest DOKLADNIE ten CAID; przy multi-CAS (usluga
+   * oferuje kilka CA-systemow rownolegle) to tylko reprezentatywny
+   * przyklad, bo OSCam sam decyduje wewnetrznie, ktorego faktycznie
+   * uzyl - TVH tego nie widzi przez capmt.
+   */
+  uint16_t td_caid;
 
   th_descrambler_keystate_t td_keystate;
 
@@ -98,6 +124,29 @@ typedef struct th_descrambler {
   uint32_t td_ecm_time_max;   /* ms - najwolniejsza                        */
   uint32_t td_ecm_time_last;  /* ms - ostatnia                             */
   uint64_t td_ecm_time_sum;   /* ms - suma (srednia = sum / count)         */
+
+  /*
+   * nowosc: ile razy TEN czytnik zostal awaryjnie promowany z cache'u
+   * standby na aktywny (patrz descrambler_standby_promote()) - dowod, ze
+   * szybki failover realnie zadzialal, nie tylko ze jest wlaczony.
+   * Widoczne w Status -> CA Readers razem z td_standby_valid (bity 0/1 =
+   * ma TERAZ gotowy, swiezy klucz zapasowy - czy failover ma z czego
+   * skorzystac w tej chwili, gdyby byl potrzebny).
+   */
+  uint32_t td_failover_count;
+
+  /*
+   * nowosc: krotki, czytelny dla czlowieka powod OSTATNIEJ nieudanej
+   * odpowiedzi ECM od tego czytnika - "co odpowiedzial serwer karty, czy
+   * to byl blad" (Status -> CA Readers). td_ecm_nok liczy TYLKO
+   * przejscia w DS_FORBIDDEN (patrz komentarz przy nim wyzej), ale np.
+   * cclient.c (cccam/newcamd) potrafi dostac kilka NOK-ow z rzedu (np.
+   * "Already has a key for service" od serwera, gdy inny czytnik juz
+   * wygral wyscig) zanim faktycznie przejdzie w DS_FORBIDDEN - tutaj
+   * ladujemy KAZDY z tych powodow na biezaco, nie tylko ten ostatni,
+   * finalny. Pusty string = brak bledu/jeszcze nie bylo NOK.
+   */
+  char td_ecm_last_error[80];
 
 } th_descrambler_t;
 
@@ -145,6 +194,18 @@ typedef struct th_descrambler_runtime {
    */
   int64_t  dr_ok_time;
   int64_t  dr_watchdog_last;
+  /*
+   * nowosc (dynamiczny wybor najszybszego ECM, tylko gdy wlaczony
+   * config.descrambler_ecm_race): dotad "pierwszy wygrywa i zostaje
+   * aktywny na zawsze" - kolejne, szybsze odpowiedzi od "cieplych"
+   * czytnikow standby byly ignorowane, dopoki aktywny sam nie padnie.
+   * dr_last_speed_switch ogranicza czestotliwosc oportunistycznych
+   * przelaczen na wykrycie "ktos jest wyraznie szybszy" (patrz
+   * descrambler_maybe_switch_to_faster() w descrambler.c), zeby nie
+   * przeskakiwac miedzy czytnikami na kazdym pojedynczym szumowym
+   * pomiarze.
+   */
+  int64_t  dr_last_speed_switch;
   /*
    * nowosc (nowa #1 - adaptacyjny bufor): "znak wodny" (w pakietach TS,
    * juz z marginesem) tego, ile realnie naplynelo zanim ostatnie klucze

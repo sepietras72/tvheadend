@@ -105,6 +105,17 @@ typedef struct cccam {
   uint8_t cccam_cansid;
 
   uint8_t cccam_busy;
+  /*
+   * nowosc: mclk() w momencie ustawienia cccam_busy - patrz
+   * cccam_set_busy() nizej. Bez tego, jesli serwer w ogole NIE
+   * ODPOWIE na zadanie (nie NOK, nie klucz, ZERO odpowiedzi - inaczej
+   * niz przypadki, ktore juz obslugujemy w cccam_running_reply()),
+   * flaga zostaje ustawiona NA ZAWSZE i polaczenie jest trwale
+   * zablokowane - zaden z dotychczasowych fixow (PARTNER:, reset przy
+   * loginie) nie pomaga, bo wszystkie zakladaja ze JAKAS odpowiedz w
+   * koncu przyjdzie.
+   */
+  int64_t cccam_busy_since;
 
   struct cccam_crypt_block sendblock;
   struct cccam_crypt_block recvblock;
@@ -134,6 +145,18 @@ static inline const char *cccam_get_build_str(cccam_t *cccam)
   return cccam_build_str[ver];
 }
 
+/*
+ * nowosc: ile najdluzej czekamy na JAKAKOLWIEK odpowiedz (klucz, NOK,
+ * PARTNER:, cokolwiek obslugiwane w cccam_running_reply()) zanim
+ * uznamy zadanie za porzucone i odblokujemy polaczenie samodzielnie.
+ * Typowy czas odpowiedzi ECM to setki ms; 5s to hojny margines, ktory
+ * nigdy nie przeszkodzi normalnie dzialajacemu, tylko wolnemu
+ * serwerowi, a jednoczesnie nie trzyma polaczenia trwale zablokowanego,
+ * gdy serwer w ogole nie odpowiada (patrz komentarz przy
+ * cccam_busy_since w cccam_t).
+ */
+#define CCCAM_BUSY_TIMEOUT sec2mono(5)
+
 /**
  *
  */
@@ -141,9 +164,16 @@ static inline int cccam_set_busy(cccam_t *cccam)
 {
   if (cccam->cccam_extended)
     return 0;
-  if (cccam->cccam_busy)
-    return 1;
+  if (cccam->cccam_busy) {
+    if (mclk() - cccam->cccam_busy_since < CCCAM_BUSY_TIMEOUT)
+      return 1;
+    tvhwarn(cccam->cc_subsys,
+            "%s: previous ECM request never got a reply (>%ds) - "
+            "unblocking connection", cccam->cc_name,
+            (int)(CCCAM_BUSY_TIMEOUT / 1000000));
+  }
   cccam->cccam_busy = 1;
+  cccam->cccam_busy_since = mclk();
   return 0;
 }
 
@@ -460,7 +490,23 @@ cccam_running_reply(cccam_t *cccam, uint8_t *buf, int len)
       if (len > 5) {
         /* partner detection */
         if (len >= 12 && strncmp((char *)buf + 4, "PARTNER:", 8) == 0) {
+          /*
+           * bugfix: to byla JEDYNA sciezka w tym switchu obslugujaca
+           * odpowiedz na nasze zadanie ECM (NOK1/NOK2 - w koncu to jego
+           * case), ktora NIE wolala cccam_unset_busy(). Gdy serwer
+           * (np. przy klasycznym, nie-EXT CCcam, gdzie w locie moze
+           * byc tylko JEDNO zadanie na raz - patrz cccam_set_busy())
+           * wysle informacje "PARTNER:" zamiast normalnej odpowiedzi
+           * NOK/klucz na TO zadanie, flaga cccam_busy zostawala
+           * ustawiona NA STALE - kazde kolejne zadanie ECM na tym
+           * polaczeniu bylo od tej pory porzucane jako "server is
+           * busy" (patrz cccam_send_ecm()), bez zadnej szansy na
+           * odzyskanie sie samo z siebie (ani retry z poprzedniej
+           * poprawki, ani nic innego, nie moglo pomoc - polaczenie
+           * bylo trwale zablokowane od strony TVH, nie serwera).
+           */
           cccam_handle_partner(cccam, buf + 4);
+          cccam_unset_busy(cccam);
         } else {
           goto req;
         }
@@ -669,6 +715,18 @@ cccam_send_login(cccam_t *cccam)
     tvhinfo(cccam->cc_subsys, "%s: login succeeded", cccam->cc_name);
   }
 
+  /*
+   * nowosc (zabezpieczenie): cccam_busy przetrwa reconnect (cccam_t
+   * zyje dluzej niz pojedyncze polaczenie TCP - patrz cc_thread() w
+   * cclient.c), wiec gdyby cokolwiek innego (poza juz poprawionym
+   * przypadkiem PARTNER: powyzej w cccam_running_reply()) kiedys
+   * zostawilo ja "zawieszona" na 1, swiezo zalogowane polaczenie NIGDY
+   * by sie z tego samo nie podnioslo - wymuszamy tutaj czysty stan,
+   * bo swiezo zalogowane polaczenie z definicji nie ma jeszcze zadnego
+   * zadania w locie.
+   */
+  cccam_unset_busy(cccam);
+
   return 0;
 }
 
@@ -686,7 +744,12 @@ cccam_send_cli_data(cccam_t *cccam)
   memcpy(buf + 20, cccam->cccam_nodeid, 8);
   buf[28] = 0; // TODO: wantemus = 1;
   strncpy((char *)buf + 29, cccam_get_version_str(cccam), 31);
-  memcpy(buf + 61, "tvh", 3); // build number (ascii)
+  /* podpisujemy sie jako oscam, nie jako tvh - niektore prywatne
+   * panele/serwery po cichu filtruja/ignoruja polaczenia identyfikujace
+   * sie jako tvheadend (przyjmuja login, ale nigdy nie odpowiadaja na
+   * ECM), traktujac to jako narzedzie do redystrybucji, podczas gdy
+   * to samo konto dziala normalnie przez oscam - patrz [[cccam-busy-seq-bugs]] */
+  memcpy(buf + 61, "osc", 3); // build number (ascii)
   cccam_send_msg(cccam, MSG_CLI_DATA, buf, size, 0, 0, 0);
 }
 
@@ -701,7 +764,7 @@ cccam_oscam_update_idnode(cccam_t *cccam)
   int32_t i;
 
   memcpy(p, cccam->cccam_nodeid, 4);
-  p[4] = 'T'; /* identify ourselves as TVH */
+  p[4] = 'O'; /* podpisujemy sie jako OSCam, nie jako TVH (bylo 'T') */
   p[5] = 0xaa;
   for (i = 0; i < 5; i++)
     p[5] ^= p[i];
@@ -774,6 +837,21 @@ cccam_send_ecm(void *cc, cc_service_t *ct, cc_ecm_section_t *es,
   if (cccam_set_busy(cccam)) {
     tvhinfo(cccam->cc_subsys, "%s: Ignore ECM request %02X (server is busy)",
             cccam->cc_name, msg[0]);
+    /*
+     * nowosc: widoczne w Status -> CA Readers (td_ecm_last_error).
+     * "busy" to NIE odpowiedz serwera - to TVH swiadomie NIE WYSYLA
+     * tego zadania, bo serwer nie zglosil "EXT" (rozszerzonych
+     * mozliwosci) przy logowaniu (patrz cccam_set_busy() - dla EXT ten
+     * warunek nigdy nie jest prawdziwy). Klasyczny (nie-EXT) CCcam
+     * pozwala na TYLKO JEDNO zadanie ECM w locie na polaczenie na raz;
+     * kolejne, nadchodzace zanim poprzednie dostanie odpowiedz, sa PO
+     * PROSTU PORZUCANE (nie kolejkowane) - im wiecej ruchu ECM na tym
+     * jednym polaczeniu (np. kilka kanalow na tym samym readerze, albo
+     * wlaczony ECM race), tym wiecej takich odrzucen.
+     */
+    snprintf(((th_descrambler_t *)ct)->td_ecm_last_error,
+             sizeof(((th_descrambler_t *)ct)->td_ecm_last_error),
+             "Request dropped: server busy (no EXT, 1 request in flight)");
     return -1;
   }
 
@@ -783,7 +861,24 @@ cccam_send_ecm(void *cc, cc_service_t *ct, cc_ecm_section_t *es,
   card_id = pcard->cs_id;
   es->es_card_id = card_id;
   sid = service_id16(t);
-  es->es_seq = seq & 0xff;
+  /*
+   * bugfix: cccam_running_reply() (odbior odpowiedzi), dla polaczen BEZ
+   * "EXT", zawsze uzywa STALEGO seq=1 do wyszukania czekajacej sekcji
+   * (cc_find_pending_section) - bo klasyczny, nie-EXT protokol CCcam w
+   * ogole nie niesie prawdziwego numeru sekwencyjnego na kablu (patrz
+   * cccam_send_msg(): "netbuf[0] = cccam_extended ? seq : 0"). Ten
+   * kod jednak zapisywal na es->es_seq SUROWY, wciaz rosnacy licznik
+   * (cccam->cc_seq) NIEZALEZNIE od trybu - wiec dla KAZDEGO zadania po
+   * pierwszym w calym zyciu polaczenia (es_seq=2,3,4,...) odpowiedz
+   * serwera (szukana pod stalym seq=1) nigdy nie trafiala w
+   * pending section. Efekt: "Got unexpected ECM reply (seqno: 1)",
+   * klucz z tej odpowiedzi byl CICHO ODRZUCANY (cccam_handle_keys()
+   * nigdy nie zostawalo wywolane), a jedynym widocznym objawem bylo to,
+   * ze polaczenie "nigdy nie dostaje odpowiedzi ECM" - mimo ze serwer
+   * odpowiadal caly czas. Teraz dla nie-EXT wymuszamy es_seq=1, dokladnie
+   * to samo, czego szuka strona odbiorcza.
+   */
+  es->es_seq = cccam->cccam_extended ? (seq & 0xff) : 1;
 
   buf = alloca(len + 13);
   buf[ 0] = caid >> 8;

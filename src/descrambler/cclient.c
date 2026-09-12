@@ -399,6 +399,47 @@ cc_ecm_idle(th_descrambler_t *th)
 }
 
 /**
+ * nowosc: sprobuj innego, jeszcze nieprobowanego CAID-u dla tej samej
+ * uslugi na tym samym readerze (patrz cs_bad_caid w cclient.h) zamiast
+ * poddawac sie na biezacym. Wywolywane z cc_ecm_reply() w dwoch
+ * miejscach - przy twardym "access denied" i przy skroncie "already
+ * has a key" (ten drugi tez moze oznaczac, ze serwer po prostu nie
+ * obsluguje TEGO CAID-u na koncie, a inny reader jest DS_RESOLVED
+ * tylko jako "cieply" standby, nie faktycznie aktywny opis).
+ *
+ * cc_service_start() sam blokuje cc_mutex/s_stream_mutex (w tej
+ * kolejnosci), a jest wywolywane tu z wnetrza cc_ecm_reply(), gdzie
+ * cc_mutex jest juz zablokowany przez wywolujacego (patrz komentarz
+ * "cc_mutex is held" w cccam.c) - trzeba je wiec chwilowo zwolnic.
+ *
+ * Zwraca 1, jesli proba przelaczenia zostala podjeta - w tym wypadku
+ * `ct`/`es` mogly zostac zniszczone (brak alternatywnego CAID-u) i
+ * wywolujacy NIE MOZE ich juz dotykac, tylko od razu return. Zwraca 0,
+ * jesli nie ma juz czego probowac (limit CC_MAX_BAD_CAID osiagniety
+ * lub biezacy CAID juz na liscie) - wywolujacy kontynuuje jak dotychczas.
+ */
+static int
+cc_try_alt_caid(cc_service_t *ct)
+{
+  cclient_t *cc = (cclient_t *)ct->cs_client;
+  mpegts_service_t *t = (mpegts_service_t *)ct->td_service;
+  int bi, already = 0;
+
+  if (ct->cs_bad_caid_count >= CC_MAX_BAD_CAID)
+    return 0;
+  for (bi = 0; bi < ct->cs_bad_caid_count; bi++)
+    if (ct->cs_bad_caid[bi] == ((th_descrambler_t *)ct)->td_caid)
+      already = 1;
+  if (already)
+    return 0;
+  ct->cs_bad_caid[ct->cs_bad_caid_count++] = ((th_descrambler_t *)ct)->td_caid;
+  tvh_mutex_unlock(&cc->cc_mutex);
+  cc_service_start((caclient_t *)cc, (service_t *)t);
+  tvh_mutex_lock(&cc->cc_mutex);
+  return 1;
+}
+
+/**
  *
  */
 void
@@ -429,18 +470,57 @@ cc_ecm_reply(cc_service_t *ct, cc_ecm_section_t *es,
 
     resolved = descrambler_resolved((service_t *)t, (th_descrambler_t *)ct);
 
+    /*
+     * nowosc: domyslny, ogolny powod tego NOK - doprecyzowywany nizej,
+     * gdy znana jest dokladniejsza przyczyna. Widoczne w Status -> CA
+     * Readers (td_ecm_last_error, patrz descrambler.h) - odpowiada na
+     * "co faktycznie odpowiedzial serwer karty".
+     */
+    snprintf(((th_descrambler_t *)ct)->td_ecm_last_error,
+             sizeof(((th_descrambler_t *)ct)->td_ecm_last_error),
+             "NOK (seqno %d, %"PRId64" ms)", seq, delay);
+
     if (es->es_nok >= CC_MAX_NOKS) {
       tvhdebug(cc->cc_subsys,
                "%s: Too many NOKs[%i] for service \"%s\"%s from %s",
                cc->cc_name, es->es_section, t->s_dvb_svcname, chaninfo, ct->td_nicename);
+      snprintf(((th_descrambler_t *)ct)->td_ecm_last_error,
+               sizeof(((th_descrambler_t *)ct)->td_ecm_last_error),
+               "NOK: too many retries");
       es->es_keystate = ES_FORBIDDEN;
       goto forbid;
     }
 
     if (resolved) {
+      /*
+       * bugfix (build28 -> build29): "already has a key" NIE oznacza,
+       * ze biezacy CAID jest zly - oznacza, ze INNY skonfigurowany
+       * reader dla tej samej uslugi juz ma dzialajacy klucz (patrz
+       * descrambler_resolved()). Wywolanie tu cc_try_alt_caid() (build28)
+       * bylo bledem: kazdy kolejny probowany CAID tez dostawal ten sam
+       * "already has a key" (bo powod nie ma nic wspolnego z CAID-em),
+       * wiec wszystkie CAID-y wyladowywaly na cs_bad_caid i caly ct byl
+       * niszczony (brak alternatywy) - obserwowalne jako nieustanne
+       * przeskakiwanie miedzy CAID-ami i "Idle" w kolko. cc_try_alt_caid
+       * zostaje TYLKO w galezi "access denied" ponizej, gdzie naprawde
+       * oznacza "ten CAID nie dziala".
+       *
+       * Zeby dalo sie ustalic, czy ten inny reader FAKTYCZNIE dostarcza
+       * obraz (a nie np. ma tylko stary/martwy DS_RESOLVED), logujemy
+       * jego nazwe - widoczne tez posrednio w Status -> CA Readers.
+       */
+      th_descrambler_t *other = NULL;
+      LIST_FOREACH(other, &((service_t *)t)->s_descramblers, td_service_link)
+        if (other != (th_descrambler_t *)ct && other->td_keystate == DS_RESOLVED)
+          break;
       tvhdebug(cc->cc_subsys,
-              "%s: NOK[%i] from %s: Already has a key for service \"%s\"",
-               cc->cc_name, es->es_section, ct->td_nicename, t->s_dvb_svcname);
+              "%s: NOK[%i] from %s: Already has a key for service \"%s\" "
+              "(resolved by: %s)",
+               cc->cc_name, es->es_section, ct->td_nicename, t->s_dvb_svcname,
+               other ? (other->td_client_name ?: other->td_nicename) : "?");
+      snprintf(((th_descrambler_t *)ct)->td_ecm_last_error,
+               sizeof(((th_descrambler_t *)ct)->td_ecm_last_error),
+               "NOK: already has a key for service");
       es->es_nok = CC_MAX_NOKS; /* do not send more ECM requests */
       es->es_keystate = ES_IDLE;
       if (ct->td_keystate == DS_READY)
@@ -482,6 +562,9 @@ forbid:
                "%s: Can not descramble service \"%s\", access denied (seqno: %d "
                "Req delay: %"PRId64" ms) from %s",
                cc->cc_name, t->s_dvb_svcname, seq, delay, ct->td_nicename);
+      snprintf(((th_descrambler_t *)ct)->td_ecm_last_error,
+               sizeof(((th_descrambler_t *)ct)->td_ecm_last_error),
+               "Access denied (all ECM exhausted)");
       descrambler_change_keystate((th_descrambler_t *)ct, DS_FORBIDDEN, 1);
       ct->ecm_state = ECM_RESET;
       /* this pid is not valid, force full scan */
@@ -499,6 +582,14 @@ forbid:
        */
       if (((service_t *)t)->s_descramble)
         descrambler_standby_promote((service_t *)t, ((service_t *)t)->s_descramble);
+      /*
+       * nowosc: ten CAID najwyrazniej nie dziala dla tej uslugi u tego
+       * dostawcy (wszystkie sekcje ECM wyczerpane, serwer trwale
+       * odmowil dostepu) - sprawdz, czy jest inny CAID do sprobowania
+       * (patrz cc_try_alt_caid()). `ct`/`es` sa nieuzywalne po tym
+       * wywolaniu, ale i tak juz nic wiecej z nimi tu nie robimy.
+       */
+      cc_try_alt_caid(ct);
     }
     return;
 
@@ -1025,8 +1116,27 @@ found:
       es->es_section = section;
       LIST_INSERT_HEAD(&ep->ep_sections, es, es_link);
     }
-    if (es->es_data_len == len && memcmp(es->es_data, data, len) == 0)
-      goto end;
+    if (es->es_data_len == len && memcmp(es->es_data, data, len) == 0) {
+      /*
+       * nowosc: to jest dokladnie ta sama tresc ECM co ostatnio - ALE
+       * jesli poprzednie zadanie dla niej (es_pending) nigdy nie
+       * dostalo odpowiedzi i czekamy juz zbyt dlugo, NIE traktuj tej
+       * (nawet identycznej) powtorki jako duplikatu do zignorowania -
+       * sprobuj ponownie. Bez tego: gdy serwer raz zgubi/zignoruje
+       * zadanie (zwlaszcza w trybie EXT, ktory nie ma zadnego innego
+       * zabezpieczenia typu timeout - to NIE jest to samo co
+       * busy-timeout w cccam.c, ktory dziala tylko dla nie-EXT), ta
+       * sekcja ECM zostaje zawieszona trwale, az do naturalnej zmiany
+       * tresci (nastepny okres kryptograficzny) - patrz CC_ECM_PENDING_TIMEOUT.
+       */
+      if (!es->es_pending ||
+          getfastmonoclock() - es->es_time < CC_ECM_PENDING_TIMEOUT)
+        goto end;
+      tvhdebug(cc->cc_subsys,
+               "%s: ECM request for service \"%s\"%s never got a reply "
+               "(>%ds) - retrying", cc->cc_name, t->s_dvb_svcname, chaninfo,
+               (int)(CC_ECM_PENDING_TIMEOUT / 1000000));
+    }
     if (es->es_data_len < len) {
       free(es->es_data);
       es->es_data = malloc(len);
@@ -1064,6 +1174,24 @@ found:
       es->es_time = getfastmonoclock();
     } else {
       es->es_pending = 0;
+      /*
+       * bugfix: es->es_data/es_data_len (powyzej) zostaly juz nadpisane
+       * NOWA trescia PRZED probą wyslania - niezaleznie od tego, czy
+       * cc_send_ecm() faktycznie wyslal cokolwiek. Gdy zwrocil bledem
+       * (np. cccam.c: klasyczny/nie-EXT serwer, "busy" - inne zadanie
+       * juz w locie na tym polaczeniu, patrz cccam_send_ecm()), ta
+       * ECM nigdy nie zostala faktycznie wyslana do serwera karty - ale
+       * cache dedup powyzej ("if (es->es_data_len == len && memcmp(...)
+       * == 0) goto end;") juz o niej "wie". DVB nadaje te sama sekcje
+       * ECM wielokrotnie w ciagu okresu kryptograficznego - bez tego
+       * czyszczenia KOLEJNA (nawet identyczna) powtorka zostalaby
+       * cicho zignorowana jako duplikat, i ta ECM nigdy nie zostalaby
+       * ponowiona az do naturalnej zmiany tresci (nastepny okres) -
+       * zbyt pozno. Zerujac es_data_len, kolejna powtorka (przewaznie
+       * w ciagu ulamka sekundy) zostanie potraktowana jako nowa i
+       * faktycznie wyslana, gdy tylko polaczenie przestanie byc zajete.
+       */
+      es->es_data_len = 0;
     }
   } else {
     if (cc->cc_forward_emm && data[0] >= 0x82 && data[0] <= 0x92) {
@@ -1102,6 +1230,7 @@ cc_service_destroy0(cclient_t *cc, th_descrambler_t *td)
   LIST_REMOVE(ct, cs_link);
 
   free(ct->td_nicename);
+  free(ct->td_client_name);
   free(ct);
 
   if (LIST_EMPTY(&cc->cc_services) && cc->cc_no_services)
@@ -1156,6 +1285,16 @@ cc_service_start(caclient_t *cac, service_t *t)
   LIST_FOREACH(pcard, &cc->cc_cards, cs_card) {
     if (!pcard->cs_running) continue;
     if (pcard->cs_ra.caid == 0) continue;
+    if (ct) {
+      /* nowosc: pomin CAID, ktory serwer juz ostatecznie odrzucil dla
+       * tej uslugi na tym readerze (cs_bad_caid, patrz cclient.h i
+       * galaz "access denied" w cc_ecm_reply()) - inaczej wybor ponizej
+       * zawsze trafialby w ten sam, martwy CAID */
+      for (i = 0; i < ct->cs_bad_caid_count; i++)
+        if (ct->cs_bad_caid[i] == pcard->cs_ra.caid)
+          break;
+      if (i < ct->cs_bad_caid_count) continue;
+    }
     TAILQ_FOREACH(st, &t->s_components.set_filter, es_filter_link) {
       if (prefpid_lock == PREFCAPID_FORCE && prefpid != st->es_pid)
         continue;
@@ -1171,6 +1310,20 @@ cc_service_start(caclient_t *cac, service_t *t)
   if (!pcard) {
     if (ct) cc_service_destroy0(cc, (th_descrambler_t*)ct);
     goto end;
+  }
+  if (ct && ct->td_caid != pcard->cs_ra.caid) {
+    /* nowosc: wybralismy inny CAID niz poprzednio (poprzedni trafil do
+     * cs_bad_caid powyzej) - odblokuj readera i zresetuj stan ECM,
+     * inaczej zostalby trwale w DS_FORBIDDEN mimo swiezego, jeszcze
+     * nieprobowanego CAID-u */
+    tvhinfo(cc->cc_subsys,
+            "%s: service \"%s\": CAID %04X was rejected by the server, "
+            "trying CAID %04X instead", cc->cc_name,
+            ((mpegts_service_t *)t)->s_dvb_svcname,
+            ct->td_caid, pcard->cs_ra.caid);
+    ct->td_caid = pcard->cs_ra.caid;
+    ct->ecm_state = ECM_INIT;
+    descrambler_change_keystate((th_descrambler_t *)ct, DS_READY, 0);
   }
   if (ct) {
     reuse = 1;
@@ -1205,6 +1358,11 @@ cc_service_start(caclient_t *cac, service_t *t)
   snprintf(buf, sizeof(buf), "%s-%s-%04X",
            cc->cc_id, cc->cc_name, pcard->cs_ra.caid);
   td->td_nicename      = strdup(buf);
+  /* nowosc: przyjazna nazwa (Configuration -> Conditional Access "Client
+     name"), do UI - patrz td_client_name w descrambler.h */
+  idnode_get_title(&cac->cac_id, NULL, buf, sizeof(buf));
+  td->td_client_name   = strdup(buf);
+  td->td_caid          = pcard->cs_ra.caid;
   td->td_service       = t;
   td->td_stop          = cc_service_destroy;
   td->td_ecm_reset     = cc_ecm_reset;

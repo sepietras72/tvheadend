@@ -353,6 +353,7 @@ const statusChildren: RouteRecordRaw[] = [
   leaf('streams', 'status-streams', () => import('@/views/status/StreamView.vue'), 'Stream', 'admin'),
   leaf('subscriptions', 'status-subscriptions', () => import('@/views/status/SubscriptionsView.vue'), 'Subscriptions', 'admin'),
   leaf('connections', 'status-connections', () => import('@/views/status/ConnectionsView.vue'), 'Connections', 'admin'),
+  leaf('ca-readers', 'status-ca-readers', () => import('@/views/status/CaReadersView.vue'), 'CA Readers', 'admin'),
   leaf('service-mapper', 'status-service-mapper', () => import('@/views/status/ServiceMapperView.vue'), 'Service Mapper', 'admin'),
   leaf('log', 'status-log', () => import('@/views/status/LogView.vue'), 'Log', 'admin'),
 ]

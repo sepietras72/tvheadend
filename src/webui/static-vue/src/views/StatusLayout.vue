@@ -24,6 +24,7 @@ const tabs = [
   { to: '/status/streams', label: t('Stream') },
   { to: '/status/subscriptions', label: t('Subscriptions') },
   { to: '/status/connections', label: t('Connections') },
+  { to: '/status/ca-readers', label: t('CA Readers') },
   { to: '/status/service-mapper', label: t('Service Mapper') },
   { to: '/status/log', label: t('Log') },
 ]

@@ -66,6 +66,18 @@ struct tvh_input_stream_stats
   /* Note: PER = ec_block / tc_block (0...1) */
   int ec_block;  ///< ERROR_BLOCK_COUNT
   int tc_block;  ///< TOTAL_BLOCK_COUNT
+
+  /*
+   * nowosc: podglad w GUI wyniku auto-rankingu tunerow po jakosci
+   * (config.mpegts_quality_ranking, patrz mpegts_mux_instance_quality_penalty()
+   * w input/mpegts/mpegts_input.c). quality_penalty to WPROST ta wartosc
+   * (0-3), ktora w tej chwili jest odejmowana od priorytetu tunera przy
+   * wyborze dla nowej subskrypcji; quality_samples to ile probek juz
+   * zebrano (ponizej progu penalty i tak zawsze wynosi 0 - to pole mowi,
+   * czy tuner jest jeszcze "w rozgrzewce"). Oba 0, gdy funkcja wylaczona.
+   */
+  int quality_penalty;
+  int quality_samples;
 };
 
 struct tvh_input_stream {

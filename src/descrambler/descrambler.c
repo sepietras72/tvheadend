@@ -932,6 +932,81 @@ descrambler_reader_stat_ecm ( th_descrambler_t *td, uint32_t ecmtime )
   td->td_ecm_time_last = ecmtime;
   td->td_ecm_time_sum += ecmtime;
   td->td_ecm_count++;
+  /* nowosc: udana odpowiedz - wyczysc powod ostatniego bledu, zeby
+     td_ecm_last_error pokazywal TYLKO biezacy/ostatni realny problem,
+     nie stary blad sprzed odzyskania */
+  td->td_ecm_last_error[0] = '\0';
+}
+
+#define ECM_RACE_SWITCH_MIN_MARGIN_MS 20   /* pomin czysty szum pomiaru */
+#define ECM_RACE_SWITCH_COOLDOWN      3    /* sekundy - patrz komentarz nizej */
+
+/*
+ * nowosc: "pierwszy wygrywa i zostaje aktywny na zawsze" bylo
+ * strukturalnie niepelne wzgledem oryginalnej prosby "zawsze odpytuj
+ * wszystkich i wybieraj najszybszego" - dotychczas dotyczylo to tylko
+ * PIERWSZEGO rozstrzygniecia (albo failovera po awarii), nigdy pozniejszej,
+ * biezacej zmiany "kto akurat odpowiada szybciej". Przy wlaczonym ECM
+ * race (config.descrambler_ecm_race) "cieple" czytniki standby caly czas
+ * odpytuja wlasne serwery na kazdym cyklu ECM - ta funkcja przelacza na
+ * kogos, kto ZA OSTATNIM razem odpowiedzial szybciej niz aktywny, czyli
+ * najbardziej doslowne "wybierz szybszego TERAZ" (porownanie
+ * td_ecm_time_last, nie sredniej z historii - to bylaby ospala
+ * reakcja).
+ *
+ * Jedyna ochrona przed "fruwaniem" miedzy czytnikami o niemal identycznej
+ * szybkosci (gdzie kto "wygrywa" zalezaloby od zwyklego szumu sieci) to
+ * mala, bezwzgledna granica (20ms) i krotki cooldown
+ * (dr_last_speed_switch, 3s) - wystarczajaco krotki, zeby nie
+ * przeszkadzac normalnej rotacji CW (typowy interval to >=10s), ale
+ * chroniacy przed przelaczaniem kilka razy w ciagu jednego cyklu, gdyby
+ * kilku czytnikow odpowiedzialo niemal jednoczesnie. Uzywa tej samej,
+ * juz przetestowanej, nie-destrukcyjnej sciezki co awaryjny failover
+ * (descrambler_standby_promote(), ktora sama wybiera najszybszego
+ * sposrod dostepnych kandydatow po sredniej - patrz zmiana tam wyzej).
+ */
+static void
+descrambler_maybe_switch_to_faster
+  ( service_t *t, th_descrambler_runtime_t *dr, th_descrambler_t *td )
+{
+  th_descrambler_t *active;
+  int64_t now;
+
+  if (!ecm_race_enabled())
+    return;
+  active = t->s_descrambler;
+  if (active == NULL || active == td || td->td_keystate == DS_RESOLVED)
+    return;
+  if (!td->td_standby_valid)
+    return;
+  if (td->td_ecm_count == 0 || active->td_ecm_count == 0)
+    return; /* jeszcze zadnego pomiaru po ktorejs ze stron - nie ma czego porownywac */
+
+  now = mclk();
+  if (dr->dr_last_speed_switch &&
+      dr->dr_last_speed_switch + sec2mono(ECM_RACE_SWITCH_COOLDOWN) > now)
+    return;
+
+  if (active->td_ecm_time_last < ECM_RACE_SWITCH_MIN_MARGIN_MS)
+    return; /* aktywny juz jest szybki - nie ma sensu ryzykowac przelaczenia */
+  /*
+   * bugfix: td_ecm_time_last jest uint32_t - odejmowanie bez tego
+   * warunku, gdy td jest w rzeczywistosci WOLNIEJSZY (last >= active),
+   * podkreciloby sie (unsigned underflow) do ogromnej liczby i
+   * BLEDNIE przeszlo test ponizej jako "wystarczajaco szybszy".
+   */
+  if (td->td_ecm_time_last >= active->td_ecm_time_last)
+    return; /* nie szybszy w ogole tym razem */
+  if (active->td_ecm_time_last - td->td_ecm_time_last < ECM_RACE_SWITCH_MIN_MARGIN_MS)
+    return; /* niewystarczajaco szybszy - moze byc zwykly szum */
+
+  dr->dr_last_speed_switch = now;
+  tvhinfo(LS_DESCRAMBLER,
+          "%s: switching to faster reader for service \"%s\" "
+          "(last %ums vs current active last %ums)",
+          td->td_nicename, t->s_nicename,
+          td->td_ecm_time_last, active->td_ecm_time_last);
+  descrambler_standby_promote(t, dr);
 }
 
 void
@@ -958,6 +1033,14 @@ descrambler_notify( th_descrambler_t *td,
   if (((td->td_ecm_count + td->td_ecm_nok) & 15) == 0)
     descrambler_reader_stats_dump((service_t *)t, "periodic");
   tvh_mutex_unlock(&t->s_stream_mutex);
+
+  /*
+   * nowosc: sprawdz TERAZ, zanim ewentualnie wyjdziemy jako "inactive"
+   * ponizej - to jest dokladnie ten scenariusz (odpowiedz od cieplego
+   * czytnika standby, nie od aktywnego).
+   */
+  if (((service_t *)t)->s_descramble)
+    descrambler_maybe_switch_to_faster((service_t *)t, ((service_t *)t)->s_descramble, td);
 
   if (t->s_descrambler != td)
     return;
@@ -1477,6 +1560,7 @@ descrambler_standby_promote( service_t *t, th_descrambler_runtime_t *dr )
   uint8_t standby_even[16], standby_odd[16];
   uint8_t standby_valid = 0, standby_type = 0;
   uint16_t standby_pid = 0;
+  uint32_t promote_avg = 0, avg;
 
   /*
    * bugfix: td_standby_* jest zapisywane pod t->s_stream_mutex w
@@ -1513,8 +1597,21 @@ descrambler_standby_promote( service_t *t, th_descrambler_runtime_t *dr )
       td->td_standby_valid = 0; /* zbyt stary - odrzuc */
       continue;
     }
-    promote = td;
-    break;
+    /*
+     * nowosc: gdy jest kilku eligible kandydatow (typowo dzieki ECM
+     * race - patrz config.descrambler_ecm_race), wybierz tego o
+     * najlepszej dotychczasowej sredniej odpowiedzi ECM zamiast
+     * pierwszego napotkanego w kolejnosci listy - to byla przypadkowa
+     * kolejnosc rejestracji klientow, nie miala nic wspolnego z tym,
+     * ktory realnie odpowiada szybciej. Brak probek (td_ecm_count==0)
+     * traktujemy jako "nieznane, gorsze niz cokolwiek zmierzone", zeby
+     * dalej preferowac sprawdzonego kandydata nad calkowicie nowym.
+     */
+    avg = td->td_ecm_count ? (uint32_t)(td->td_ecm_time_sum / td->td_ecm_count) : UINT32_MAX;
+    if (promote == NULL || avg < promote_avg) {
+      promote = td;
+      promote_avg = avg;
+    }
   }
   if (promote) {
     standby_valid = promote->td_standby_valid;
@@ -1525,6 +1622,7 @@ descrambler_standby_promote( service_t *t, th_descrambler_runtime_t *dr )
     if (standby_valid & 2)
       memcpy(standby_odd, promote->td_standby_odd, sizeof(standby_odd));
     promote->td_standby_valid = 0;
+    promote->td_failover_count++;  /* nowosc: widoczne w Status -> CA Readers */
   }
   tvh_mutex_unlock(&t->s_stream_mutex);
 
@@ -1841,7 +1939,30 @@ queue:
                   mono2ms(now - dr->dr_ok_time),
                   ((mpegts_service_t *)t)->s_dvb_svcname);
           tvh_mutex_unlock(&t->s_stream_mutex);
-          descrambler_standby_promote(t, dr);
+          if (!descrambler_standby_promote(t, dr)) {
+            /*
+             * nowosc: nikt inny nie mial gotowego zapasu - poszturchaj
+             * SAMEGO aktywnego czytnika, zeby natychmiast ponowil
+             * biezace ECM, zamiast biernie czekac az samo dojdzie w
+             * naturalnym cyklu. Wolamy td_ecm_reset() BEZPOSREDNIO na
+             * tym jednym czytniku - NIGDY przez ogolny ecm_reset()
+             * (ten, gdy klient zwraca 0 z td_ecm_reset - jak
+             * capmt_ecm_reset()/cc_ecm_reset() - uniewaznia WSZYSTKIE
+             * klucze w dr, co bylo zrodlem wczesniejszej regresji w
+             * tej sesji: zdrowy, tylko chwilowo spozniony czytnik
+             * tracil jeszcze wazny klucz w polowie cyklu). Bezposrednie
+             * wywolanie resetuje WYLACZNIE wewnetrzny stan tego klienta
+             * (np. cc_ecm_reset() czysci cache ostatnio wyslanej sekcji
+             * ECM, wiec kolejne, nawet identyczne powtorzenie tej samej
+             * sekcji w transporcie - DVB nadaje ja wielokrotnie w ciagu
+             * okresu kryptograficznego - zostanie potraktowane jako
+             * nowe i ponowione do serwera karty, zamiast czekac
+             * bezczynnie az tresc ECM faktycznie sie zmieni).
+             */
+            th_descrambler_t *cur = t->s_descrambler;
+            if (cur && cur->td_ecm_reset)
+              cur->td_ecm_reset(cur);
+          }
           tvh_mutex_lock(&t->s_stream_mutex);
         }
       }

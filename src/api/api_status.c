@@ -26,6 +26,7 @@
 #include "api.h"
 #include "tcp.h"
 #include "input.h"
+#include "descrambler/descrambler.h"
 #include "epggrab.h"  //Needed to get the next EPG grab times
 #include "dvr/dvr.h"  //Needed to get the next schedule dvr time
 
@@ -76,6 +77,102 @@ api_status_subscriptions
     e = subscription_create_msg(ths, perm->aa_lang_ui);
     htsmsg_add_msg(l, NULL, e);
     c++;
+  }
+  tvh_mutex_unlock(&global_lock);
+
+  *resp = htsmsg_create_map();
+  htsmsg_add_msg(*resp, "entries", l);
+  htsmsg_add_u32(*resp, "totalCount", c);
+
+  return 0;
+}
+
+/*
+ * nowosc: podglad "kto opisuje/odszyfrowuje co" - jeden wiersz per
+ * (usluga aktualnie ogladana/nagrywana, klient CA obslugujacy ja).
+ * Dotad metryki liczone w descrambler.c (td_ecm_count/nok/time_*,
+ * patrz descrambler.h) byly widoczne tylko w logu - to domyka je w
+ * UI (Status -> CA Readers).
+ *
+ * Enumerujemy przez subskrypcje (nie przez wszystkie skonfigurowane
+ * uslugi) - interesuja nas tylko czytnicy obslugujacy cos, co ktos
+ * faktycznie w tej chwili oglada/nagrywa. Jedna usluga moze miec
+ * wielu subskrybentow, wiec odrzucamy duplikaty po wskazniku service_t.
+ *
+ * "id" w odpowiedzi to adres wskaznika th_descrambler_t jako string -
+ * te obiekty nie maja wlasnego UUID, a potrzebny jest stabilny klucz
+ * do StatusGrid (Vue) na czas zycia czytnika.
+ */
+static int
+api_status_ca_readers
+  ( access_t *perm, void *opaque, const char *op, htsmsg_t *args, htsmsg_t **resp )
+{
+  int c = 0, i, nseen = 0, dup;
+  htsmsg_t *l, *e;
+  th_subscription_t *ths;
+  service_t *t, *seen[256];
+  th_descrambler_t *td;
+  char idbuf[24];
+
+  l = htsmsg_create_list();
+
+  tvh_mutex_lock(&global_lock);
+  LIST_FOREACH(ths, &subscriptions, ths_global_link) {
+    t = ths->ths_service;
+    if (t == NULL) continue;
+
+    dup = 0;
+    for (i = 0; i < nseen; i++)
+      if (seen[i] == t) { dup = 1; break; }
+    if (dup) continue;
+    if (nseen < (int)ARRAY_SIZE(seen))
+      seen[nseen++] = t;
+
+    tvh_mutex_lock(&t->s_stream_mutex);
+    LIST_FOREACH(td, &t->s_descramblers, td_service_link) {
+      snprintf(idbuf, sizeof(idbuf), "%p", (void *)td);
+      e = htsmsg_create_map();
+      htsmsg_add_str(e, "id", idbuf);
+      /* nowosc: plain nazwa uslugi (np. "Eurosport 4 HD"), nie
+         s_nicename ktore sklada "Siec/Mux/Usluga" - to drugie jest
+         przydatne w logach, ale za dlugie/nieczytelne w tej kolumnie */
+      htsmsg_add_str(e, "service", ((mpegts_service_t *)t)->s_dvb_svcname ?: "");
+      /* nowosc: przyjazna nazwa klienta (Configuration -> Conditional
+         Access "Client name") zamiast td_nicename (adres+port+CAID) -
+         nie kazdy backend jeszcze go ustawia, wiec td_nicename to
+         zapasowa wartosc, a nie puste pole */
+      htsmsg_add_str(e, "reader",
+                     (td->td_client_name && *td->td_client_name) ?
+                       td->td_client_name : (td->td_nicename ?: ""));
+      /* nowosc: CAID osobno (0 = nieznane/nie-per-CAID backend, patrz
+         td_caid w descrambler.h) - format hex w UI */
+      htsmsg_add_u32(e, "caid", td->td_caid);
+      htsmsg_add_str(e, "keystate", descrambler_keystate2str(td->td_keystate));
+      htsmsg_add_u32(e, "ecm_ok", td->td_ecm_count);
+      htsmsg_add_u32(e, "ecm_nok", td->td_ecm_nok);
+      htsmsg_add_u32(e, "ecm_min", td->td_ecm_time_min);
+      htsmsg_add_u32(e, "ecm_avg", td->td_ecm_count ?
+                     (uint32_t)(td->td_ecm_time_sum / td->td_ecm_count) : 0);
+      htsmsg_add_u32(e, "ecm_max", td->td_ecm_time_max);
+      htsmsg_add_u32(e, "ecm_last", td->td_ecm_time_last);
+      /*
+       * nowosc: widok failovera. standby_ready = TERAZ ma gotowy, swiezy
+       * klucz zapasowy (td_standby_valid != 0) - gdyby aktywny czytnik
+       * padl w tej chwili, ten moze przejac natychmiast. failover_count
+       * = ile razy TEN czytnik faktycznie zostal tak promowany do tej
+       * pory (patrz descrambler_standby_promote()) - dowod, ze
+       * mechanizm dziala, nie tylko ze jest wlaczony.
+       */
+      htsmsg_add_u32(e, "standby_ready", td->td_standby_valid ? 1 : 0);
+      htsmsg_add_u32(e, "failover_count", td->td_failover_count);
+      /* nowosc: powod ostatniej nieudanej odpowiedzi ECM (pusty = brak
+         biezacego bledu, ostatnia byla udana) - patrz td_ecm_last_error
+         w descrambler.h */
+      htsmsg_add_str(e, "last_error", td->td_ecm_last_error);
+      htsmsg_add_msg(l, NULL, e);
+      c++;
+    }
+    tvh_mutex_unlock(&t->s_stream_mutex);
   }
   tvh_mutex_unlock(&global_lock);
 
@@ -247,6 +344,7 @@ void api_status_init ( void )
   static api_hook_t ah[] = {
     { "status/connections",   ACCESS_ADMIN, api_status_connections, NULL },
     { "status/subscriptions", ACCESS_ADMIN, api_status_subscriptions, NULL },
+    { "status/ca_readers",    ACCESS_ADMIN, api_status_ca_readers, NULL },
     { "status/inputs",        ACCESS_ADMIN, api_status_inputs, NULL },
     { "status/inputclrstats", ACCESS_ADMIN, api_status_input_clear_stats, NULL },
     { "status/activity",      ACCESS_ADMIN, api_status_activity, NULL },

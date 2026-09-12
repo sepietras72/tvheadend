@@ -147,6 +147,8 @@ tvh_input_stream_create_msg
   htsmsg_add_u32(m, "tc_bit", st->stats.tc_bit);
   htsmsg_add_u32(m, "ec_block", st->stats.ec_block);
   htsmsg_add_u32(m, "tc_block", st->stats.tc_block);
+  htsmsg_add_u32(m, "quality_penalty", st->stats.quality_penalty);
+  htsmsg_add_u32(m, "quality_samples", st->stats.quality_samples);
   return m;
 }
 

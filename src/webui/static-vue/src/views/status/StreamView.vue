@@ -43,6 +43,19 @@ const { t } = useI18n()
 
 const fmtKbps = (v: unknown) => (typeof v === 'number' ? Math.round(v / 1024).toString() : '')
 
+/*
+ * quality_penalty/quality_samples come from mpegts_mux_instance_quality_penalty()
+ * (server-side, config.mpegts_quality_ranking - off by default). Both are
+ * 0 when the feature is disabled or a tuner hasn't collected enough
+ * samples (<10) yet to trust a verdict - show "–" rather than a
+ * misleading "0" in that warm-up window.
+ */
+const fmtQualityPenalty = (v: unknown, row: StatusEntry) => {
+  const samples = typeof row.quality_samples === 'number' ? row.quality_samples : 0
+  if (samples < 10) return '–'
+  return typeof v === 'number' ? String(v) : '0'
+}
+
 const fmtPids = (v: unknown) => {
   if (!Array.isArray(v) || v.length === 0) return ''
   const sorted = [...(v as number[])].sort((a, b) => a - b)
@@ -120,6 +133,13 @@ const cols: ColumnDef[] = [
   { field: 'unc', label: t('Uncorrected Blocks'), sortable: true, minVisible: 'desktop' },
   { field: 'te', label: t('Transport Errors'), sortable: true, minVisible: 'desktop' },
   { field: 'cc', label: t('Continuity Errors'), sortable: true, minVisible: 'desktop' },
+  {
+    field: 'quality_penalty',
+    label: t('Priority Penalty'),
+    sortable: true,
+    minVisible: 'desktop',
+    format: fmtQualityPenalty,
+  },
 ]
 
 const clearing = ref(false)

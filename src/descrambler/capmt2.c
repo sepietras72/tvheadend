@@ -938,6 +938,7 @@ capmt_service_destroy(th_descrambler_t *td)
   tvh_mutex_unlock(&capmt->capmt_mutex);
 
   free(ct->td_nicename);
+  free(ct->td_client_name);
   free(ct);
 }
 
@@ -1154,7 +1155,35 @@ capmt_abort(capmt_t *capmt, int keystate)
 static int
 capmt_ecm_reset(th_descrambler_t *th)
 {
+  capmt_service_t *ct = (capmt_service_t *)th;
+  capmt_t *capmt = ct->ct_capmt;
+
   descrambler_change_keystate(th, DS_READY, 1);
+
+  /*
+   * nowosc: w przeciwienstwie do cclient.c (cccam/newcamd), gdzie
+   * "reset" czysci lokalny cache ostatnio wyslanej sekcji ECM, zeby
+   * wymusic jej ponowienie do serwera karty, protokol capmt/DVBAPI do
+   * OSCam NIE MA po stronie TVH takiego cache'u - TVH tylko przekazuje
+   * dalej surowy strumien PID ECM, a to OSCam sam go demultipleksuje i
+   * decyduje, kiedy zapytac swoje wlasne czytniki o klucz. Jedyna
+   * realna dzwignia to ponowne wyslanie CA_PMT (capmt_send_request(),
+   * dokladnie ten sam mechanizm co przy pierwszym (pod)laczeniu tej
+   * uslugi - patrz jego uzycie wyzej w tym pliku) z nowym numerem
+   * wersji PMT (przydzielanym wewnatrz capmt_send_request) - to powinno
+   * sklonic OSCam do ponownego przetworzenia informacji o
+   * deskramblowaniu TEGO programu, a wiec i ponownego zapytania o
+   * klucz. CAPMT_LIST_ONLY dziala na TEJ JEDNEJ usludze (nie po calej
+   * liscie), wiec INNE uslugi na tym samym polaczeniu do OSCam
+   * pozostaja nietkniete - patrz capmt_enumerate_services() gdzie ten
+   * sam autor explicite pilnuje, zeby zwykle dolaczenie kolejnego
+   * kanalu "nie przeszkadzalo tym juz dzialajacym".
+   */
+  tvh_mutex_lock(&capmt->capmt_mutex);
+  if (capmt->capmt_sock[0] >= 0)
+    capmt_send_request(ct, CAPMT_LIST_ONLY);
+  tvh_mutex_unlock(&capmt->capmt_mutex);
+
   return 0;
 }
 
@@ -1173,6 +1202,10 @@ capmt_process_key(capmt_t *capmt, uint8_t adapter, ca_info_t *cai,
     t = (mpegts_service_t *)ct->td_service;
 
     if (!ok) {
+      /* nowosc: patrz td_ecm_last_error w descrambler.h - widoczne w
+         Status -> CA Readers */
+      snprintf(ct->td_ecm_last_error, sizeof(ct->td_ecm_last_error),
+               "Access denied (OSCam reported not ok)");
       if (ct->td_keystate != DS_FORBIDDEN) {
         tvherror(LS_CAPMT2,
                  "%s: Can not descramble service \"%s\", access denied",
@@ -2501,7 +2534,8 @@ capmt_service_start(caclient_t *cac, service_t *s)
   int tuner = -1, i, change = 0;
   char buf[512];
   caid_t *c, sca;
-  
+  uint16_t first_caid = 0;
+
   lock_assert(&global_lock);
 
   /* Validate */
@@ -2575,6 +2609,12 @@ capmt_service_start(caclient_t *cac, service_t *s)
       if (t->s_dvb_forcecaid && t->s_dvb_forcecaid != c->caid)
         continue;
       capmt_caid_add(ct, t, st->es_pid, c);
+      /* nowosc: zapamietaj pierwszy dodany CAID - do UI (Status -> CA
+         Readers). Uslugi maja zwykle jeden CAS; gdy jest ich wiecej
+         (multi-CAS), pokazujemy ten pierwszy jako reprezentatywny
+         zamiast nic (patrz td_caid w descrambler.h). */
+      if (!first_caid)
+        first_caid = c->caid;
       change = 1;
     }
   }
@@ -2583,10 +2623,12 @@ capmt_service_start(caclient_t *cac, service_t *s)
     memset(&sca, 0, sizeof(sca));
     sca.caid = t->s_dvb_forcecaid;
     capmt_caid_add(ct, t, 8191, &sca);
+    first_caid = sca.caid;
     change = 1;
   }
 
   td = (th_descrambler_t *)ct;
+  td->td_caid        = first_caid;
   if (capmt_oscam_network(capmt)) {
     snprintf(buf, sizeof(buf), "capmt-%s-%i",
                                capmt->capmt_sockfile,
@@ -2595,6 +2637,10 @@ capmt_service_start(caclient_t *cac, service_t *s)
     snprintf(buf, sizeof(buf), "capmt-%s", capmt->capmt_sockfile);
   }
   td->td_nicename    = strdup(buf);
+  /* nowosc: przyjazna nazwa (Configuration -> Conditional Access "Client
+     name"), do UI - patrz td_client_name w descrambler.h */
+  idnode_get_title(&capmt->cac_id, NULL, buf, sizeof(buf));
+  td->td_client_name = strdup(buf);
   td->td_service     = s;
   td->td_stop        = capmt_service_destroy;
   td->td_caid_change = capmt_caid_change;
