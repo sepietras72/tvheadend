@@ -191,6 +191,19 @@ typedef struct capmt_service {
   /* OK flag - seems that descrambling is going on */
   uint8_t ct_ok_flag;
   mtimer_t ct_ok_timer;
+
+  /*
+   * nowosc (keep-warm dla DVBAPI/OSCam): patrz capmt_keepwarm_timer_cb()
+   * i komentarz przy td_ecm_last_sent w capmt_table_input() - w
+   * odroznieniu od cclient.c, TVH nie "pyta" tutaj samo o ECM, wiec nie
+   * ma jak samodzielnie odswiezyc "cieplego" (nie-aktywnego) czytnika.
+   * ct_last_nudge pamieta kiedy ostatnio wymusilismy ponowne CA_PMT
+   * (capmt_send_request(CAPMT_LIST_ONLY)) jako "szturchniecie" OSCam,
+   * zeby nie robic tego na kazdym cyklu timera, gdy usluga jest
+   * dluzej nieaktywna/martwa - tylko raz na cykl podbicia.
+   */
+  mtimer_t ct_keepwarm_timer;
+  int64_t  ct_last_nudge;
 } capmt_service_t;
 
 /**
@@ -903,6 +916,7 @@ capmt_service_destroy(th_descrambler_t *td)
            capmt_name(capmt), s->s_dvb_svcname, ct->ct_adapter);
 
   mtimer_disarm(&ct->ct_ok_timer);
+  mtimer_disarm(&ct->ct_keepwarm_timer);
 
   tvh_mutex_lock(&capmt->capmt_mutex);
 
@@ -2068,6 +2082,8 @@ capmt_table_input(void *opaque, int pid, const uint8_t *data, int len, int emm)
   capmt_filters_t *cf;
   dmx_filter_t *f;
   int flags = emm ? 0 : CAPMT_MSG_FAST;
+  capmt_service_t *ct;
+  capmt_caid_ecm_t *cce;
 
   /* Validate */
   if (data == NULL || len > 4096) return;
@@ -2095,6 +2111,32 @@ capmt_table_input(void *opaque, int pid, const uint8_t *data, int len, int emm)
         }
         if (i >= DMX_FILTER_SIZE || i + 2 == len) {
           tvhtrace(LS_CAPMT2, "filter match pid %d len %d emm %d", pid, len, emm);
+          /*
+           * bugfix: td_ecm_last_sent (descrambler.h, Status -> CA
+           * Readers "Last ECM Sent") zawsze pokazywal "never" dla
+           * czytnika DVBAPI/Oscam_API (capmt2) - w tym protokole TVH
+           * nigdy nie "wysyla" ECM w sensie cclient.c (zadanie/
+           * odpowiedz do zdalnego serwera): to OSCam mowi TVH, jaki PID
+           * filtrowac na adapterze, a TVH tylko PRZEKAZUJE mu surowe
+           * dane z tego filtra (capmt_filter_data() ponizej,
+           * DVBAPI_FILTER_DATA) - klucz liczy juz sam OSCam. Najblizszy
+           * odpowiednik "faktycznie wyslane do serwera karty" to wiec
+           * moment przekazania dopasowanej sekcji ECM (nie EMM) do
+           * capmt_filter_data(). Ustawiamy na wlasciwym th_descrambler_t
+           * (capmt_service_t), znajdujac go po ecmpid - dokladnie tak
+           * samo, jak juz robi to capmt_set_filter() wyzej.
+           */
+          if (!emm) {
+            LIST_FOREACH(ct, &capmt->capmt_services, ct_link) {
+              LIST_FOREACH(cce, &ct->ct_caid_ecm, cce_link)
+                if (cce->cce_ecmpid == pid) {
+                  ((th_descrambler_t *)ct)->td_ecm_last_sent = mclk();
+                  break;
+                }
+              if (cce)
+                break;
+            }
+          }
           capmt_filter_data(capmt,
                             o->adapter, demux_index,
                             filter_index, data, len,
@@ -2450,6 +2492,69 @@ capmt_send_request(capmt_service_t *ct, int lm)
   capmt_queue_msg(capmt, adapter_num, sid, buf, pos, 0);
 }
 
+/*
+ * nowosc (keep-warm dla DVBAPI/OSCam): patrz td_ecm_last_sent w
+ * capmt_table_input() powyzej - to jest znacznik "kiedy TVH ostatnio
+ * faktycznie przekazal OSCam surowa sekcje ECM z wlasnego filtra PID"
+ * (nie "kiedy OSCam odpowiedzial" - tego protokol w ogole nie
+ * ujawnia). Zaobserwowane na zywo: po serii szybkich zmian kanalu
+ * (zapping) ten znacznik potrafi zamrozniec sie na WIELE MINUT dla
+ * czytnika, ktory NIE jest akurat aktywny (standby) - czyli filtr
+ * PID/CA_SET_PID, o ktory wczesniej poprosil OSCam, przestal cokolwiek
+ * dostawac, a poniewaz to nie jest ten aktywny czytnik, zaden inny
+ * watchdog (ct_ok_timer, output watchdog w descrambler.c) tego nie
+ * lapie - usluga dalej wyglada "OK" (bo faktycznie jest, poprzez inny,
+ * aktywny czytnik), tylko TEN JEDEN staje sie bezuzyteczny do failovera
+ * i nigdy sam z siebie nie wraca do zycia.
+ *
+ * W odroznieniu od cclient.c (cccam/newcamd), gdzie "keep warm" to po
+ * prostu ponawianie WLASNEGO zadania ECM co interval, tutaj TVH nie ma
+ * takiej dzwigni bezposrednio - jedyny sposob to ponowne wyslanie
+ * calego CA_PMT (dokladnie ten sam mechanizm co przy prawdziwym
+ * resecie, capmt_ecm_reset() powyzej), co powinno sklonic OSCam do
+ * ponownego zgloszenia CA_SET_PID i tym samym odtworzenia filtra po
+ * stronie TVH. CAPMT_LIST_ONLY dziala tylko na TEJ JEDNEJ usludze.
+ */
+#define CAPMT_KEEPWARM_CHECK sec2mono(10) /* jak czesto sprawdzamy      */
+#define CAPMT_KEEPWARM_STALE sec2mono(30) /* od kiedy uznajemy za martwy */
+
+static void
+capmt_keepwarm_timer_cb(void *aux)
+{
+  capmt_service_t *ct = aux;
+  capmt_t *capmt = ct->ct_capmt;
+  th_descrambler_t *td = (th_descrambler_t *)ct;
+  mpegts_service_t *t = (mpegts_service_t *)td->td_service;
+  int64_t now = mclk();
+
+  mtimer_arm_rel(&ct->ct_keepwarm_timer, capmt_keepwarm_timer_cb, ct,
+                 CAPMT_KEEPWARM_CHECK);
+
+  /* Aktywny czytnik dostaje swiezy strumien ECM caly czas (a gdyby nie
+   * dostawal, inne mechanizmy juz by to zauwazyly) - szturchanie
+   * dotyczy wylacznie martwych czytnikow "w tle". */
+  if (td->td_keystate == DS_RESOLVED)
+    return;
+  if (td->td_ecm_last_sent != 0 && now - td->td_ecm_last_sent < CAPMT_KEEPWARM_STALE)
+    return;
+  /* Nie czesciej niz raz na CAPMT_KEEPWARM_STALE - unikamy zasypywania
+   * OSCam ponownymi CA_PMT, gdy usluga jest po prostu dluzej nieoglada. */
+  if (ct->ct_last_nudge && now - ct->ct_last_nudge < CAPMT_KEEPWARM_STALE)
+    return;
+
+  ct->ct_last_nudge = now;
+  tvhinfo(LS_CAPMT2,
+          "%s: no ECM forwarded for service \"%s\" in over %d s, "
+          "re-announcing CA_PMT to nudge OSCam",
+          capmt_name(capmt), t->s_dvb_svcname,
+          (int)(CAPMT_KEEPWARM_STALE / MONOCLOCK_RESOLUTION));
+
+  tvh_mutex_lock(&capmt->capmt_mutex);
+  if (capmt->capmt_sock[0] >= 0)
+    capmt_send_request(ct, CAPMT_LIST_ONLY);
+  tvh_mutex_unlock(&capmt->capmt_mutex);
+}
+
 static void
 capmt_enumerate_services(capmt_t *capmt, int force)
 {
@@ -2656,8 +2761,16 @@ capmt_service_start(caclient_t *cac, service_t *s)
   tvh_cond_signal(&capmt->capmt_cond, 0);
 
 fin:
-  if (ct)
+  if (ct) {
     mtimer_arm_rel(&ct->ct_ok_timer, capmt_ok_timer_cb, ct, sec2mono(3)/2);
+    /* nowosc: patrz capmt_keepwarm_timer_cb() - mtimer_arm_rel(), tak
+     * samo jak dla ct_ok_timer powyzej, po prostu przeplanowuje juz
+     * uzbrojony timer (patrz jego implementacja), wiec wielokrotne
+     * wywolania tej funkcji (kolejne zmiany PMT) nie tworza
+     * duplikatow ani nie zapetlaja odliczania w nieskonczonosc. */
+    mtimer_arm_rel(&ct->ct_keepwarm_timer, capmt_keepwarm_timer_cb, ct,
+                   CAPMT_KEEPWARM_CHECK);
+  }
   tvh_mutex_unlock(&t->s_stream_mutex);
   tvh_mutex_unlock(&capmt->capmt_mutex);
 

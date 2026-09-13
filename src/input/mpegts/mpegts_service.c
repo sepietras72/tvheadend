@@ -866,7 +866,26 @@ mpegts_service_pid_list_ ( service_t *t, void *owner )
   mpegts_pid_t *mp;
 
   if (mi == NULL) return NULL;
-  tvh_mutex_lock(&mi->mi_output_lock);
+  /*
+   * bugfix: druga instancja tego samego problemu co
+   * mpegts_input_status_timer() (mpegts_input.c) - ta funkcja ma tylko
+   * DWOCH wolajacych w calym kodzie: subscription_status_callback()
+   * (okresowy mtimer co 1s, ktory trzyma global_lock przez caly czas
+   * wykonania - patrz mtimer_thread() w main.c) i jednorazowy,
+   * synchroniczny request API (api_status.c) - w OBU przypadkach
+   * zwykly, blokujacy tvh_mutex_lock(&mi->mi_output_lock) potrafil
+   * zawiesic global_lock w nieskonczonosc, jesli akurat cos innego
+   * (np. mpegts_input_thread() przetwarzajacy pakiet TS) trzymalo
+   * mi_output_lock dluzej niz zwykle - zlapane na zywym, zawieszonym
+   * procesie przez gdb (global_lock.mutex.__data.__owner wskazywal na
+   * ten timer). Nieudana proba oznacza po prostu pusta/nieaktualna
+   * liste PID-ow na TEN JEDEN request - dla okresowego statusu
+   * niezauwazalne (odswiezy sie za sekunde), dla API - nieszkodliwie
+   * rzadki, chwilowo niekompletny wynik. Znacznie lepsze niz
+   * zamrozenie calego serwera.
+   */
+  if (tvh_mutex_trylock(&mi->mi_output_lock))
+    return NULL;
   mm = ms->s_dvb_mux;
   RB_FOREACH(mp, &mm->mm_pids, mp_link) {
     RB_FOREACH(mps, &mp->mp_subs, mps_link) {

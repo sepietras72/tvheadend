@@ -953,8 +953,63 @@ descrambler_reader_stat_ecm ( th_descrambler_t *td, uint32_t ecmtime )
   td->td_ecm_last_error[0] = '\0';
 }
 
-#define ECM_RACE_SWITCH_MIN_MARGIN_MS 20   /* pomin czysty szum pomiaru */
-#define ECM_RACE_SWITCH_COOLDOWN      3    /* sekundy - patrz komentarz nizej */
+/*
+ * bugfix: 20ms/3s bylo w praktyce ZUPELNIE nieskuteczna ochrona przed
+ * "fruwaniem" - z realnych logow (wiele czytnikow CCcam2 na roznych
+ * serwerach, "Polsat Viasat History HD" i inne): td_ecm_time_last
+ * potrafi skakac od 27ms do 4500ms POMIEDZY KOLEJNYMI cyklami TEGO
+ * SAMEGO czytnika (zwykly szum sieci/obciazenia serwera karty, nie
+ * realna, trwala roznica jakosci polaczenia) - 20ms marginesu to ulamek
+ * tego szumu, wiec funkcja przelaczala aktywnego czytnika PRAWIE NA
+ * KAZDYM cyklu ECM (~co 10-20s, bez przerwy, caly czas), gonoac
+ * przypadkowe, jednorazowe pomiary. Z 3s cooldownem (krotszym niz
+ * typowy interval ECM) to nic nie ograniczalo - funkcja byla
+ * odpytywana i tak dopiero przy kolejnym ECM, ~10s pozniej. Efekt:
+ * "cannot decode packets"/przycinanie obrazu WYSTEPOWALO CZESCIEJ przy
+ * wlaczonym ECM race niz bez niego - samo ciagle przelaczanie aktywnego
+ * zrodla klucza bylo bardziej szkodliwe dla ciaglosci niz nominalna
+ * korzysc z "zawsze najszybszy". Podniesione do wartosci, ktore
+ * faktycznie odrozniaja "trwale szybszy" od zwyklego szumu pomiaru.
+ */
+#define ECM_RACE_SWITCH_MIN_MARGIN_MS 200  /* prawdziwa, znaczaca roznica */
+#define ECM_RACE_SWITCH_COOLDOWN      30   /* sekundy - kilka cykli ECM, nie jeden */
+
+/*
+ * bugfix: analiza logow (korelacja timestampow "switching to faster
+ * reader"/"fast failover" z nastepujacymi po nich "cannot decode
+ * packets" dla TEJ SAMEJ uslugi) pokazala, ze 44 z 78 przypadkow utraty
+ * dekodowania wystapilo w ciagu 15s PO opportunistycznym przelaczeniu
+ * (mediana zaledwie 3s), a tylko 2 byly odwrotnie (reaktywny switch PO
+ * utracie dekodowania - czyli to, do czego mechanizm mial sluzyc).
+ * Najgorzej wypadl Sky (jedyny serwer z EXT, wiec i najwiecej
+ * przelaczen) - 29% jego przelaczen konczylo sie przerwa w ciagu 5s.
+ *
+ * Przyczyna: "fast failover" podstawia ZCACHOWANY wczesniej klucz
+ * standby (td_standby_even/odd) zamiast robic swiezy ECM. Ten klucz byl
+ * zapisany przez OSOBNY, "cieply" cykl ECM czytnika kandydata - moze
+ * miec az dr_ecm_standby_age (typowo ~caly interval ECM, ~10s - patrz
+ * ECM_STANDBY_AGE_DEFAULT) i wciaz przechodzic istniejacy test "nie za
+ * stary". Przy okresie kryptograficznym tej samej dlugosci co
+ * dopuszczalny wiek cache'u, promowany klucz ma spora (rzedu 50%)
+ * szanse byc juz z POPRZEDNIEGO okresu wzgledem tego, co aktualnie
+ * leci na danej parzystosci w strumieniu - CSA dostaje zly CW, dekoduje
+ * smieci, dopoki nastepny prawdziwy cykl ECM (u nowo-aktywnego czytnika)
+ * naturalnie sie nie zsynchronizuje. To tlumaczy 2-3s medianę: tyle
+ * zajmuje, zanim strumien faktycznie trafi na parzystosc, dla ktorej
+ * podstawiony klucz jest juz nieaktualny.
+ *
+ * To dotyczy WYLACZNIE przelaczenia "bo akurat ktos jest szybszy"
+ * (descrambler_maybe_switch_to_faster, ponizej) - czysto oportunistyczna
+ * optymalizacja, aktywny czytnik dalej normalnie dziala. Awaryjny
+ * failover (utrata aktywnego, prefer==NULL w descrambler_standby_promote)
+ * NIE jest tu zawezany - tam nawet ryzykowny, niepewny klucz jest
+ * lepszy niz brak jakiegokolwiek obrazu, wiec zostaje dr_ecm_standby_age.
+ * Dla samej "pogoni za szybszym" wymagamy duzo swiezszego cache'u -
+ * ulamek typowego okresu kryptograficznego, nie caly okres - zamiast
+ * ryzykownego przelaczenia po prostu pomijamy ten cykl (bezpieczny
+ * no-op, sprobujemy ponownie przy kolejnym ECM).
+ */
+#define ECM_RACE_SWITCH_STANDBY_MAX_AGE_MS 2000
 
 /*
  * nowosc: "pierwszy wygrywa i zostaje aktywny na zawsze" bylo
@@ -969,16 +1024,22 @@ descrambler_reader_stat_ecm ( th_descrambler_t *td, uint32_t ecmtime )
  * td_ecm_time_last, nie sredniej z historii - to bylaby ospala
  * reakcja).
  *
- * Jedyna ochrona przed "fruwaniem" miedzy czytnikami o niemal identycznej
- * szybkosci (gdzie kto "wygrywa" zalezaloby od zwyklego szumu sieci) to
- * mala, bezwzgledna granica (20ms) i krotki cooldown
- * (dr_last_speed_switch, 3s) - wystarczajaco krotki, zeby nie
- * przeszkadzac normalnej rotacji CW (typowy interval to >=10s), ale
- * chroniacy przed przelaczaniem kilka razy w ciagu jednego cyklu, gdyby
- * kilku czytnikow odpowiedzialo niemal jednoczesnie. Uzywa tej samej,
- * juz przetestowanej, nie-destrukcyjnej sciezki co awaryjny failover
- * (descrambler_standby_promote(), ktora sama wybiera najszybszego
- * sposrod dostepnych kandydatow po sredniej - patrz zmiana tam wyzej).
+ * Ochrona przed "fruwaniem" miedzy czytnikami o realnie podobnej
+ * szybkosci (patrz bugfix przy stalych ECM_RACE_SWITCH_* powyzej -
+ * pierwotne 20ms/3s okazaly sie w praktyce nieskuteczne, bo
+ * td_ecm_time_last potrafi wahac sie o rzedy wielkosci miedzy kolejnymi
+ * cyklami tego samego czytnika) to teraz znaczaca, bezwzgledna granica
+ * (200ms) i dluzszy cooldown (30s, kilka cykli ECM zamiast jednego) -
+ * przelaczamy tylko gdy kandydat jest TRWALE, WYRAZNIE szybszy, nie za
+ * kazdym razem gdy akurat wypadnie mu lepszy pojedynczy pomiar. Uzywa
+ * tej samej, juz przetestowanej, nie-destrukcyjnej sciezki co awaryjny
+ * failover (descrambler_standby_promote()) - ale przekazujac jej WPROST
+ * tego konkretnego, wlasnie potwierdzonego jako szybszy `td` (parametr
+ * `prefer`), a nie zdajac sie na jej wlasny ranking po sredniej. Ten
+ * ranking ma sens tylko gdy nie ma juz wiadomego kandydata (awaryjny
+ * failover po utracie aktywnego) - tutaj mielibysmy dokladnie problem z
+ * bugfixa opisanego w descrambler.h przy `prefer`: log mowilby "X
+ * szybszy", a awansowany zostalby ktos inny.
  */
 static void
 descrambler_maybe_switch_to_faster
@@ -998,8 +1059,15 @@ descrambler_maybe_switch_to_faster
     return; /* jeszcze zadnego pomiaru po ktorejs ze stron - nie ma czego porownywac */
 
   now = mclk();
-  if (dr->dr_last_speed_switch &&
-      dr->dr_last_speed_switch + sec2mono(ECM_RACE_SWITCH_COOLDOWN) > now)
+  /*
+   * bugfix: cooldown per-KANDYDAT (td_last_speed_promote na TYM
+   * konkretnym readerze), nie jeden wspolny na cala usluge - patrz
+   * komentarz przy td_last_speed_promote w descrambler.h. Przelaczenie
+   * na inny reader (np. sasiedni port Sky) nie zuzywa juz "biletu"
+   * nalezacego do TEGO kandydata.
+   */
+  if (td->td_last_speed_promote &&
+      td->td_last_speed_promote + sec2mono(ECM_RACE_SWITCH_COOLDOWN) > now)
     return;
 
   if (active->td_ecm_time_last < ECM_RACE_SWITCH_MIN_MARGIN_MS)
@@ -1015,13 +1083,13 @@ descrambler_maybe_switch_to_faster
   if (active->td_ecm_time_last - td->td_ecm_time_last < ECM_RACE_SWITCH_MIN_MARGIN_MS)
     return; /* niewystarczajaco szybszy - moze byc zwykly szum */
 
-  dr->dr_last_speed_switch = now;
+  td->td_last_speed_promote = now;
   tvhinfo(LS_DESCRAMBLER,
           "%s: switching to faster reader for service \"%s\" "
           "(last %ums vs current active last %ums)",
           td->td_nicename, t->s_nicename,
           td->td_ecm_time_last, active->td_ecm_time_last);
-  descrambler_standby_promote(t, dr);
+  descrambler_standby_promote(t, dr, td);
 }
 
 void
@@ -1579,7 +1647,8 @@ key_find_struct( th_descrambler_runtime_t *dr,
  * inny reader mogl miec w tym momencie idealnie swiezy cache standby.
  */
 int
-descrambler_standby_promote( service_t *t, th_descrambler_runtime_t *dr )
+descrambler_standby_promote( service_t *t, th_descrambler_runtime_t *dr,
+                              th_descrambler_t *prefer )
 {
   th_descrambler_t *td, *promote = NULL;
   int64_t now = mclk();
@@ -1624,8 +1693,45 @@ descrambler_standby_promote( service_t *t, th_descrambler_runtime_t *dr )
       continue;
     }
     /*
+     * bugfix: gdy wywolujacy przekazal konkretnego kandydata (patrz
+     * `prefer` w descrambler.h) - bo sam juz ustalil, ze TEN czytnik
+     * jest wyraznie szybszy TERAZ (td_ecm_time_last) - honoruj ten
+     * wybor wprost i nie przebijaj go inna srednia. Bez tego "switching
+     * to faster reader X" w logu i faktycznie awansowany czytnik mogly
+     * byc dwoma roznymi readerami.
+     */
+    if (prefer) {
+      if (td != prefer)
+        continue; /* nie ten kandydat - szukaj dalej na liscie */
+      /*
+       * bugfix: patrz ECM_RACE_SWITCH_STANDBY_MAX_AGE_MS powyzej - dla
+       * czysto oportunistycznego "przelacz na szybszego" wymagamy DUZO
+       * swiezszego cache'u niz ogolny dr_ecm_standby_age (ktory
+       * dopuszcza cache tak stary jak caly okres kryptograficzny, co w
+       * logach korelowalo z "cannot decode packets" 2-3s po
+       * przelaczeniu). Gdy nie jest wystarczajaco swiezy, po prostu NIE
+       * przelaczamy tym razem (promote zostaje NULL) - aktywny czytnik
+       * dalej normalnie dziala, sprobujemy ponownie przy kolejnym ECM z
+       * (mamy nadzieje) swiezszym cache'em. Kandydat jest jeden i
+       * jednoznaczny (wskaznik `prefer`), wiec po jego znalezieniu -
+       * przyjety czy odrzucony - konczymy skanowanie listy.
+       */
+      if (now - td->td_standby_time > ms2mono(ECM_RACE_SWITCH_STANDBY_MAX_AGE_MS)) {
+        tvhtrace(LS_DESCRAMBLER,
+                 "standby_promote:   %s speed-switch candidate too stale for "
+                 "opportunistic promotion (%ldms > %dms), skipping this cycle",
+                 td->td_nicename, (long)((now - td->td_standby_time) / 1000),
+                 ECM_RACE_SWITCH_STANDBY_MAX_AGE_MS);
+        break;
+      }
+      promote = td;
+      break;
+    }
+    /*
      * nowosc: gdy jest kilku eligible kandydatow (typowo dzieki ECM
-     * race - patrz config.descrambler_ecm_race), wybierz tego o
+     * race - patrz config.descrambler_ecm_race) i wywolujacy NIE
+     * wskazal konkretnego (prefer == NULL - awaryjny failover po
+     * utracie aktywnego, bez znanego z gory kandydata), wybierz tego o
      * najlepszej dotychczasowej sredniej odpowiedzi ECM zamiast
      * pierwszego napotkanego w kolejnosci listy - to byla przypadkowa
      * kolejnosc rejestracji klientow, nie miala nic wspolnego z tym,
@@ -1674,7 +1780,7 @@ ecm_reset( service_t *t, th_descrambler_runtime_t *dr )
   th_descrambler_key_t *tk;
   int ret = 0, i;
 
-  if (descrambler_standby_promote(t, dr))
+  if (descrambler_standby_promote(t, dr, NULL))
     return 1;
 
   /* reset the reader ECM state */
@@ -1965,7 +2071,7 @@ queue:
                   mono2ms(now - dr->dr_ok_time),
                   ((mpegts_service_t *)t)->s_dvb_svcname);
           tvh_mutex_unlock(&t->s_stream_mutex);
-          if (!descrambler_standby_promote(t, dr)) {
+          if (!descrambler_standby_promote(t, dr, NULL)) {
             /*
              * nowosc: nikt inny nie mial gotowego zapasu - poszturchaj
              * SAMEGO aktywnego czytnika, zeby natychmiast ponowil

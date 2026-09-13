@@ -73,6 +73,12 @@ interface Props {
    * `status_subscriptions`, `status_connections`,
    * `status_service_mapper`). Unset → no Help button (Log tab). */
   helpPage?: string
+  /* Optional per-row class resolver, forwarded verbatim to DataGrid's
+   * own `rowClass` (see there for the full contract) - lets a Status
+   * view highlight rows by data-driven state (e.g. CA Readers marking
+   * the currently-active/fastest reader per service) without
+   * StatusGrid needing to know what "active" or "fastest" mean. */
+  rowClass?: (row: Row) => string | undefined
 }
 
 const props = defineProps<Props>()
@@ -276,6 +282,7 @@ defineExpose({ selection, clearSelection, toggleSelect })
       column-resize-mode="expand"
       :reorderable-columns="true"
       :column-actions="{ sort: true, hide: true, resetWidth: true }"
+      :row-class="rowClass"
       class="status-grid"
       @sort="onSortChange"
       @set-sort="onSetSort"

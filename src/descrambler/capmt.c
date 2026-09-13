@@ -2103,6 +2103,8 @@ capmt_table_input(void *opaque, int pid, const uint8_t *data, int len, int emm)
   capmt_filters_t *cf;
   dmx_filter_t *f;
   int flags = emm ? 0 : CAPMT_MSG_FAST;
+  capmt_service_t *ct;
+  capmt_caid_ecm_t *cce;
 
   /* Validate */
   if (data == NULL || len > 4096) return;
@@ -2130,6 +2132,25 @@ capmt_table_input(void *opaque, int pid, const uint8_t *data, int len, int emm)
         }
         if (i >= DMX_FILTER_SIZE || i + 2 == len) {
           tvhtrace(LS_CAPMT, "filter match pid %d len %d emm %d", pid, len, emm);
+          /*
+           * bugfix: patrz identyczny komentarz w capmt2.c
+           * capmt_table_input() - td_ecm_last_sent najblizszym
+           * odpowiednikiem "wyslane do serwera karty" jest tu moment
+           * przekazania dopasowanej sekcji ECM (nie EMM) do
+           * capmt_filter_data() (DVBAPI_FILTER_DATA), bo to OSCam, nie
+           * TVH, decyduje kiedy "wysylac" ECM w sensie cclient.c.
+           */
+          if (!emm) {
+            LIST_FOREACH(ct, &capmt->capmt_services, ct_link) {
+              LIST_FOREACH(cce, &ct->ct_caid_ecm, cce_link)
+                if (cce->cce_ecmpid == pid) {
+                  ((th_descrambler_t *)ct)->td_ecm_last_sent = mclk();
+                  break;
+                }
+              if (cce)
+                break;
+            }
+          }
           capmt_filter_data(capmt,
                             o->adapter, demux_index,
                             filter_index, data, len,

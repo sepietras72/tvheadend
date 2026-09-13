@@ -164,6 +164,39 @@ typedef struct th_descrambler {
    */
   int64_t td_ecm_last_sent;
 
+  /*
+   * nowosc: czy POLACZENIE tego readera faktycznie negocjowalo z
+   * serwerem "EXT" (CCcam OSCam-rozszerzenie - wiele rownoleglych
+   * zadan ECM w locie na jednym polaczeniu) - patrz cc_multi_ecm w
+   * cclient.h, ustawiane w cccam2.c dopiero po odebraniu "[EXT]" w
+   * PARTNER: od serwera, NIE z lokalnej konfiguracji readera. 0 =
+   * klasyczne polaczenie (albo nie dotyczy - capmt/OSCam lokalny, albo
+   * stary cccam.c) - tylko jedno zadanie ECM w locie na raz. 1 =
+   * potwierdzony EXT. Widoczne w Status -> CA Readers jako kolumna
+   * "EXT", zeby od razu bylo widac, ktore polaczenia moga bezpiecznie
+   * obsluzyc wiele jednoczesnie ogladanych kanalow na tym samym
+   * readerze bez wzajemnego "zaglodzenia" ("server is busy").
+   */
+  uint8_t td_ext;
+
+  /*
+   * bugfix: dr_last_speed_switch (w th_descrambler_runtime_t) byl JEDEN
+   * WSPOLNY cooldown na cala usluge, dzielony przez WSZYSTKICH
+   * kandydatow - realny problem, gdy usluga ma kilka niemal identycznych
+   * polaczen do TEGO SAMEGO serwera (np. 6 osobnych logowan do Sky) obok
+   * jednego, calkiem innego zrodla (np. capmt2/OSCam). Te "blizniacze"
+   * polaczenia caly czas przelaczaja sie MIEDZY SOBA (drobny szum
+   * pomiaru wystarczy, zeby ktores z nich na chwile wyprzedzilo aktywne)
+   * i za kazdym razem zuzywaja WSPOLNY bilet cooldownu - w efekcie
+   * calkiem inny, wartosciowy kandydat (realna redundancja, inny
+   * dostawca) moze nigdy nie dostac szansy, nawet gdy akurat jest
+   * wyraznie szybszy, bo cooldown jest wlasnie zajety przez niezwiazane
+   * przelaczenie miedzy blizniaczymi polaczeniami. Teraz cooldown jest
+   * per-KANDYDAT (ten znacznik, na TYM konkretnym readerze) zamiast
+   * per-usluga - przelaczenie na X nie blokuje juz szansy dla Y.
+   */
+  int64_t td_last_speed_promote;
+
 } th_descrambler_t;
 
 typedef struct th_descrambler_key {
@@ -215,13 +248,14 @@ typedef struct th_descrambler_runtime {
    * config.descrambler_ecm_race): dotad "pierwszy wygrywa i zostaje
    * aktywny na zawsze" - kolejne, szybsze odpowiedzi od "cieplych"
    * czytnikow standby byly ignorowane, dopoki aktywny sam nie padnie.
-   * dr_last_speed_switch ogranicza czestotliwosc oportunistycznych
-   * przelaczen na wykrycie "ktos jest wyraznie szybszy" (patrz
-   * descrambler_maybe_switch_to_faster() w descrambler.c), zeby nie
-   * przeskakiwac miedzy czytnikami na kazdym pojedynczym szumowym
-   * pomiarze.
+   * Ochrone przed przeskakiwaniem miedzy czytnikami na kazdym
+   * pojedynczym szumowym pomiarze dawal tu kiedys jeden, wspolny na
+   * cala usluge cooldown (dr_last_speed_switch) - przeniesiony na
+   * td_last_speed_promote (per-KANDYDAT, w th_descrambler_t) z powodu
+   * opisanego tam bugfixa: wspolny licznik dawal nieuczciwa przewage
+   * "blizniaczym" polaczeniom do tego samego serwera kosztem realnie
+   * innych kandydatow.
    */
-  int64_t  dr_last_speed_switch;
   /*
    * nowosc (nowa #1 - adaptacyjny bufor): "znak wodny" (w pakietach TS,
    * juz z marginesem) tego, ile realnie naplynelo zanim ostatnie klucze
@@ -335,8 +369,27 @@ int  descrambler_resolved      ( struct service *t, th_descrambler_t *ignore );
  * sie powiodla (jakis td dostal nowy, aktywny klucz), 0 w przeciwnym
  * razie (brak waznego cache'u - wywolujacy powinien wtedy wymusic
  * normalny, pelny reset ECM).
+ *
+ * bugfix: `prefer` - gdy wywolujacy JUZ WIE ktorego konkretnie
+ * czytnika chce awansowac (descrambler_maybe_switch_to_faster() w
+ * descrambler.c, po tym jak sam porownal td_ecm_time_last i uznal go
+ * za wyraznie szybszego TERAZ od aktywnego), przekazuje go tutaj -
+ * funkcja honoruje ten wybor wprost, zamiast (jak wczesniej) zawsze
+ * przeliczac wlasny ranking po SREDNIEJ z historii (avg) i mogac wybrac
+ * KOGOS INNEGO niz ten, ktory wlasnie zostal udowodniony jako szybszy.
+ * To byla realna rozbieznosc - log mowil "switching to faster reader
+ * X", a faktycznie awansowany (fast failover using cached standby key)
+ * bywal reader Y o lepszej sredniej ale gorszym biezacym wynikiem, wiec
+ * UI (kolumna EXT/podswietlenie "najszybszy TERAZ") i rzeczywiste
+ * dzialanie failovera potrafily wskazywac dwoch roznych czytnikow -
+ * efekt "nie przelacza sie na najszybszy" mimo ze mechanizm technicznie
+ * dzialal, tylko na niewlasciwym kandydacie. NULL (pozostali
+ * wywolujacy - awaryjny failover po utracie aktywnego, bez znanego z
+ * gory kandydata) zachowuje stare zachowanie: wybierz najlepsza
+ * srednia sposrod wszystkich waznych standby.
  */
-int  descrambler_standby_promote( struct service *t, th_descrambler_runtime_t *dr );
+int  descrambler_standby_promote( struct service *t, th_descrambler_runtime_t *dr,
+                                   th_descrambler_t *prefer );
 int  descrambler_multi_pid     ( th_descrambler_t *t );
 void descrambler_keys          ( th_descrambler_t *t, int type, uint16_t pid,
                                  const uint8_t *even, const uint8_t *odd );

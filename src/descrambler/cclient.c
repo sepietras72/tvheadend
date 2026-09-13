@@ -17,6 +17,14 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/*
+ * nowosc: pthread_timedjoin_np() (patrz cc_conf_changed() nizej,
+ * diagnostyka zawieszenia na zamknieciu) jest rozszerzeniem GNU i
+ * wymaga _GNU_SOURCE zdefiniowanego PRZED pierwszym naglowkiem
+ * systemowym - projekt nie definiuje tego globalnie w Makefile.
+ */
+#define _GNU_SOURCE
+
 #include <fcntl.h>
 #include <signal.h>
 
@@ -139,10 +147,32 @@ provider_exists(cc_card_data_t *pcard, uint32_t providerid)
 static int
 verify_provider(cc_card_data_t *pcard, uint32_t providerid)
 {
-  if(providerid == 0)
-    return 1;
-
-  return provider_exists(pcard, providerid);
+  /*
+   * bugfix: to kiedys odrzucalo dopasowanie CAID, jesli podany provider
+   * ID (z PMT uslugi) nie wystepowal w liscie providerow, jaka serwer
+   * sam zglosil w CARD_DATA (provider_exists()) - w efekcie
+   * cc_service_start() nigdy nawet nie tworzyl obiektu readera dla
+   * takiej pary usluga+serwer (np. reader "Sky" mial CAID 1861, ale
+   * jego CARD_DATA nie wymienialo dokladnie tego provider ID, ktory
+   * mial ten konkretny kanal - "Polsat Sport 2" - wiec Sky nigdy nie
+   * byl nawet probowany, mimo ze faktycznie mial do niego dostep).
+   * Zweryfikowane wprost w zrodlach OSCam (/root/oscam,
+   * matching_reader() w oscam-chk.c): dopasowuje readera do uslugi
+   * TYLKO po CAID (z lokalnie skonfigurowanej listy), nigdy po
+   * provider ID z CARD_DATA - i tak wysyla ECM, pozwalajac serwerowi
+   * samemu odpowiedziec NOK, jesli faktycznie nie ma uprawnien. Lista
+   * providerow w CARD_DATA jest w realnym ekosystemie CCcam czesto
+   * niepelna/celowo zaciemniona przez operatorow serwerow - nie nadaje
+   * sie jako twardy filtr PRZED wyslaniem ECM. Dopasowujemy wiec teraz
+   * tylko po CAID (jak OSCam) - provider ID jest nadal logowane (ponizej)
+   * gdy nie pasuje, dla diagnostyki, ale juz nie blokuje probowania.
+   */
+  if (providerid != 0 && !provider_exists(pcard, providerid))
+    tvhtrace(LS_DESCRAMBLER,
+             "verify_provider: CAID %04X provider %06X not in server's "
+             "CARD_DATA list [ID:%08X] - trying anyway (like OSCam)",
+             pcard->cs_ra.caid, providerid, pcard->cs_id);
+  return 1;
 }
 
 /**
@@ -413,6 +443,25 @@ cc_ecm_idle(th_descrambler_t *th)
  * cc_mutex jest juz zablokowany przez wywolujacego (patrz komentarz
  * "cc_mutex is held" w cccam.c) - trzeba je wiec chwilowo zwolnic.
  *
+ * bugfix: brakowalo tu drugiej czesci tego samego problemu - prawdziwy
+ * deadlock, zlapany na zywym procesie przez gdb (global_lock.mutex.
+ * __data.__owner wskazywal na watek mtimer). cc_service_start() WYMAGA
+ * trzymania global_lock (patrz jej wlasny komentarz) - nikt tu tego
+ * nigdy nie brial. W miedzyczasie watek mtimer (np. co 250ms,
+ * satip_frontend_signal_cb() w satip_frontend.c) trzyma global_lock i
+ * czeka na t->s_stream_mutex, zeby dostarczyc status sygnalu do
+ * service'ow na tym mux-ie - gdy MY (z cc_table_input(), trzymajac
+ * wlasnie t->s_stream_mutex) probowalismy przez cc_service_start()
+ * dostac global_lock, to byl klasyczny AB-BA. Fix: bierzemy global_lock
+ * (w poprawnej, standardowej dla TVH kolejnosci - global_lock
+ * NAJPIERW), ale s_stream_mutex trzeba zwolnic TYLKO gdy wywolujacy go
+ * faktycznie trzyma - stream_mutex_held mowi, ktory to przypadek (1 =
+ * cc_table_input(), oba call site'y; 0 = cc_ecm_reply(), gdzie s_stream_mutex
+ * nigdy nie jest brany - zwalnianie nietrzymanej blokady byloby
+ * niezdefiniowanym zachowaniem). ct/t (w przeciwienstwie do samego *ct)
+ * nie sa niszczone przez cc_service_start(), wiec ponowne zablokowanie
+ * ich po powrocie jest bezpieczne.
+ *
  * Zwraca 1, jesli proba przelaczenia zostala podjeta - w tym wypadku
  * `ct`/`es` mogly zostac zniszczone (brak alternatywnego CAID-u) i
  * wywolujacy NIE MOZE ich juz dotykac, tylko od razu return. Zwraca 0,
@@ -420,7 +469,7 @@ cc_ecm_idle(th_descrambler_t *th)
  * lub biezacy CAID juz na liscie) - wywolujacy kontynuuje jak dotychczas.
  */
 static int
-cc_try_alt_caid(cc_service_t *ct)
+cc_try_alt_caid(cc_service_t *ct, int stream_mutex_held)
 {
   cclient_t *cc = (cclient_t *)ct->cs_client;
   mpegts_service_t *t = (mpegts_service_t *)ct->td_service;
@@ -434,9 +483,15 @@ cc_try_alt_caid(cc_service_t *ct)
   if (already)
     return 0;
   ct->cs_bad_caid[ct->cs_bad_caid_count++] = ((th_descrambler_t *)ct)->td_caid;
+  if (stream_mutex_held)
+    tvh_mutex_unlock(&t->s_stream_mutex);
   tvh_mutex_unlock(&cc->cc_mutex);
+  tvh_mutex_lock(&global_lock);
   cc_service_start((caclient_t *)cc, (service_t *)t);
+  tvh_mutex_unlock(&global_lock);
   tvh_mutex_lock(&cc->cc_mutex);
+  if (stream_mutex_held)
+    tvh_mutex_lock(&t->s_stream_mutex);
   return 1;
 }
 
@@ -545,6 +600,30 @@ cc_ecm_reply(cc_service_t *ct, cc_ecm_section_t *es,
        * ES_IDLE. Bez wyscigu ECM zachowanie zostaje jak dawniej
        * (oszczedzanie polaczenia backupowego - trwaly stan spoczynku).
        */
+      /*
+       * bugfix (cofniete): probowalismy tu wymagac cc->cc_multi_ecm
+       * (patrz cclient.h) - wylaczyc "keep warm" na klasycznych (bez
+       * EXT) polaczeniach, zeby nie glodzily innych, aktywnie
+       * ogladanych kanalow na tym samym readerze (obserwowane jako do
+       * 36s bez ECM na przeciazonym koncie). W praktyce (test na
+       * zywym ruchu) to POGORSZYLO ciaglosc obrazu: te same klasyczne
+       * readery (staff.servebeer, 2vip1, EgyGold) prawie NIGDY nie sa
+       * faktycznie aktywnym resolverem (Sky/EXT niemal zawsze wygrywa
+       * jako szybszy) - ich "keep warm" caly czas byl ruchem
+       * WZGLEDEM SIEBIE (kilka kanalow jednoczesnie "podgrzewanych"
+       * przez tego samego, wolnego, klasycznego readera), a nie
+       * konkurencja z realnym ruchem aktywnego resolvera. Calkowite
+       * wylaczenie oznaczalo wiec, ze przy JAKIEJKOLWIEK, nawet
+       * chwilowej czkawce Sky (np. gdy wszystkie porty Sky dzielą
+       * to samo, akurat przeciazone lacze), nie bylo juz ZADNEGO
+       * gotowego, swiezego klucza zapasowego do natychmiastowego
+       * przejecia - a to zdarzalo sie czesciej niz oryginalny problem
+       * 36s. Throttlowanie tez nie dziala (dr_ecm_standby_age domyslnie
+       * ~10s = okres kryptograficzny - rzadsze podgrzewanie i tak
+       * zdazy "wygasnac" zanim bedzie potrzebne). Wracamy wiec do
+       * bezwarunkowego "keep warm" (jak w build38-48) - to jedyna
+       * wersja, ktora w realnym teście wypadla lepiej.
+       */
       if (config.descrambler_ecm_race) {
         /*
          * "already has a key" nie jest dowodem, ze CAID/karta nie dziala -
@@ -622,7 +701,7 @@ forbid:
        * od innego, juz gotowego (choc na razie nieaktywnego) klienta CA.
        */
       if (((service_t *)t)->s_descramble)
-        descrambler_standby_promote((service_t *)t, ((service_t *)t)->s_descramble);
+        descrambler_standby_promote((service_t *)t, ((service_t *)t)->s_descramble, NULL);
       /*
        * nowosc: ten CAID najwyrazniej nie dziala dla tej uslugi u tego
        * dostawcy (wszystkie sekcje ECM wyczerpane, serwer trwale
@@ -630,7 +709,7 @@ forbid:
        * (patrz cc_try_alt_caid()). `ct`/`es` sa nieuzywalne po tym
        * wywolaniu, ale i tak juz nic wiecej z nimi tu nie robimy.
        */
-      cc_try_alt_caid(ct);
+      cc_try_alt_caid(ct, 0 /* cc_ecm_reply() nie trzyma t->s_stream_mutex */);
     }
     return;
 
@@ -1039,6 +1118,77 @@ end_of_job:
 }
 
 /**
+ * bugfix (uzupelnienie cc_expire_stale_pending ponizej): wygaszanie
+ * PORZUCONYCH sekcji usuwa tylko czesc ryzyka - dwie NADAL swieze,
+ * jednoczesnie oczekujace sekcje (obie legalnie w locie, zadna nie jest
+ * "za stara") wciaz moga dostac TEN SAM obciety numer, jesli
+ * wspoldzielony licznik akurat okraza w tym samym momencie. Zaobserwowane
+ * na zywo - kolizje "Got unexpected ECM reply" nadal wystepowaly nawet
+ * z wygaszaniem porzuconych wpisow. Ta funkcja usuwa przyczyne u zrodla:
+ * wolana PRZED faktycznym uzyciem kandydata na nowy es_seq (patrz
+ * cccam2_send_ecm() w cccam2.c), pozwala nadawcy sprawdzic, czy ten
+ * konkretny numer nie jest juz zajety przez INNA, wciaz oczekujaca
+ * sekcje na TYM SAMYM polaczeniu - jesli tak, nadawca probuje kolejnej
+ * wartosci zamiast slepo uzywac pierwszej z licznika.
+ */
+int
+cc_seq_in_use(cclient_t *cc, int seq, cc_ecm_section_t *self)
+{
+  cc_service_t *ct2;
+  cc_ecm_pid_t *ep2;
+  cc_ecm_section_t *es2;
+
+  LIST_FOREACH(ct2, &cc->cc_services, cs_link)
+    LIST_FOREACH(ep2, &ct2->cs_ecm_pids, ep_link)
+      LIST_FOREACH(es2, &ep2->ep_sections, es_link)
+        if (es2 != self && es2->es_pending && es2->es_seq == seq)
+          return 1;
+  return 0;
+}
+
+/**
+ * bugfix: w trybie EXT (cc_multi_ecm) numer sekwencyjny na przewodzie
+ * (es_seq) jest obciety do 1 bajta i to JEDEN, WSPOLNY licznik
+ * (cc->cc_seq) dla WSZYSTKICH uslug jednoczesnie obslugiwanych na tym
+ * samym polaczeniu (jedno logowanie do serwera karty czesto serwuje
+ * kilka rownolegle ogladanych/utrzymywanych "cieplo" kanalow na raz).
+ * Sekcja ECM, ktora nigdy nie dostala odpowiedzi i zostaje "pending"
+ * bez konca (es_pending=1), moze po pelnym okrazeniu tych 256 wartosci
+ * dostac DOKLADNIE TAKI SAM numer jak zupelnie nowe, niezwiazane
+ * zadanie na INNEJ usludze tego samego polaczenia - wtedy odpowiedz
+ * serwera trafia losowo do jednego z dwoch pasujacych wpisow
+ * (cc_find_pending_section() zwraca pierwszy napotkany), a prawdziwy
+ * adresat konczy jako "Got unexpected ECM reply". Zaobserwowane na
+ * zywo - jednoczesnie na WSZYSTKICH portach jednego serwera (bo maja
+ * podobny wzorzec ruchu, wiec ich liczniki okrazaja mniej wiecej razem).
+ *
+ * Wolane TUZ PRZED przydzieleniem nowego seq (w cc_send_ecm ponizej) -
+ * porzucamy (es_pending=0) kazda INNA sekcje ECM na TYM POLACZENIU,
+ * ktora czeka na odpowiedz dluzej niz CC_ECM_PENDING_TIMEOUT. Bez
+ * odpowiedzi po tylu ms serwer i tak juz prawie na pewno nie odpowie -
+ * zamiast wisiec w nieskonczonosc i pozniej zderzyc sie z nowym,
+ * zawinietym numerem, taki "duch" przestaje byc "pending", wiec nie
+ * moze juz nic ukrasc. `self` (biezaco wysylana sekcja) jest jawnie
+ * wykluczona - jej es_pending zostalo dopiero co ustawione na 1 przez
+ * TEN SAM cykl, wiec nie moze byc jeszcze "stara".
+ */
+static void
+cc_expire_stale_pending(cclient_t *cc, cc_ecm_section_t *self)
+{
+  cc_service_t *ct2;
+  cc_ecm_pid_t *ep2;
+  cc_ecm_section_t *es2;
+  int64_t now = getfastmonoclock();
+
+  LIST_FOREACH(ct2, &cc->cc_services, cs_link)
+    LIST_FOREACH(ep2, &ct2->cs_ecm_pids, ep_link)
+      LIST_FOREACH(es2, &ep2->ep_sections, es_link)
+        if (es2 != self && es2->es_pending &&
+            now - es2->es_time >= CC_ECM_PENDING_TIMEOUT)
+          es2->es_pending = 0;
+}
+
+/**
  *
  */
 static void
@@ -1183,7 +1333,7 @@ found:
                cc->cc_name, t->s_dvb_svcname, chaninfo,
                (int)(CC_ECM_PENDING_TIMEOUT / 1000000));
       if (++es->es_silent_retries >= CC_MAX_SILENT_RETRIES &&
-          cc_try_alt_caid(ct))
+          cc_try_alt_caid(ct, 1 /* cc_table_input() trzyma t->s_stream_mutex */))
         goto end;
     }
     if (es->es_data_len == len && memcmp(es->es_data, data, len) == 0) {
@@ -1218,7 +1368,7 @@ found:
        * zwrocilo 1 (mogly zostac zniszczone/przekonfigurowane).
        */
       if (++es->es_silent_retries >= CC_MAX_SILENT_RETRIES &&
-          cc_try_alt_caid(ct))
+          cc_try_alt_caid(ct, 1 /* cc_table_input() trzyma t->s_stream_mutex */))
         goto end;
     }
     if (es->es_data_len < len) {
@@ -1250,12 +1400,25 @@ found:
       goto end;
     }
 
+    cc_expire_stale_pending(cc, es);
+
     if (cc->cc_send_ecm(cc, ct, es, pcard, data, len) == 0) {
       tvhdebug(cc->cc_subsys,
                "%s: Sending ECM%s section=%d/%d for service \"%s\" (seqno: %d)",
                cc->cc_name, chaninfo, section,
                ep->ep_last_section, t->s_dvb_svcname, es->es_seq);
       es->es_time = getfastmonoclock();
+      /*
+       * bugfix: td_ecm_last_sent (descrambler.h, Status -> CA Readers
+       * "Last ECM Sent") byl ustawiany tylko w cccam2_send_ecm()
+       * (cccam2.c), wiec dla starego cccam.c i cwc.c (newcamd) - oba
+       * tez korzystaja z tego samego cc_table_input() przez wskaznik
+       * cc_send_ecm - kolumna zawsze pokazywala "never". To jest
+       * jedyne miejsce wspolne dla WSZYSTKICH protokolow cclient,
+       * ktore widzi udany zwrot z cc_send_ecm() - wlasciwe miejsce na
+       * ten znacznik, analogicznie do es_time tuz powyzej.
+       */
+      ((th_descrambler_t *)ct)->td_ecm_last_sent = mclk();
     } else {
       es->es_pending = 0;
       /*
@@ -1347,7 +1510,10 @@ cc_service_start(caclient_t *cac, service_t *t)
   cc_service_t *ct;
   th_descrambler_t *td;
   elementary_stream_t *st;
-  caid_t *c;
+  caid_t *c = NULL; /* bugfix: -Werror=maybe-uninitialized - patrz nowa
+                        galaz "slepego" probowania CAID ponizej, gdzie
+                        c moze byc sprawdzone bez wczesniejszego
+                        przypisania (puste cc_cards/set_filter) */
   cc_card_data_t *pcard;
   char buf[512];
   int i, pid, reuse = 0, prefpid, prefpid_lock, forcecaid;
@@ -1405,6 +1571,70 @@ cc_service_start(caclient_t *cac, service_t *t)
       if (c) break;
     }
     if (st) break;
+  }
+  if (!pcard) {
+    /*
+     * nowosc: zaden z kart, ktore serwer FAKTYCZNIE nam zglosil (CARD_DATA),
+     * nie pasowal CAID-em do zadnego CA-deskryptora tej uslugi - ale lista
+     * kart w CCcam jest w praktyce czesto niepelna/celowo zaciemniona przez
+     * operatora serwera (patrz przypadek "Sky" - serwer po cccam2 zglasza
+     * tylko 3 z ~27 realnie posiadanych CAID-ow). Prawdziwy OSCam
+     * (matching_reader() w oscam-chk.c) nigdy nie wymaga takiego
+     * potwierdzenia z CARD_DATA - dopasowuje readera do uslugi tylko po
+     * CAID (z lokalnie skonfigurowanej listy) i po prostu wysyla ECM z
+     * card_id=0 ("dowolna karta"), pozwalajac serwerowi samemu
+     * zdecydowac. Robimy wiec to samo jako ostatnia deska ratunku: jesli
+     * usluga oferuje CAID, ktorego jeszcze NIE probowalismy na tym
+     * readerze (nie ma w cs_bad_caid), tworzymy "wirtualna" karte
+     * (card_id=0, bez providerow) i probujemy mimo braku potwierdzenia z
+     * CARD_DATA. Istniejacy mechanizm es_silent_retries/cc_try_alt_caid
+     * (max. CC_MAX_SILENT_RETRIES prob bez ZADNEJ odpowiedzi) i tak
+     * zrezygnuje z tego CAID-u po kilku nieudanych probach, dokladnie
+     * jak dla realnej karty - patrz cc_table_input().
+     *
+     * nowosc: ograniczone tylko do readerow, ktore W TEJ CHWILI nigdzie
+     * indziej faktycznie nie dekoduja (zaden ich cc_service_t nie jest
+     * DS_RESOLVED) - taki reader i tak stoi bezczynnie, wiec "slepa"
+     * probka nic nie kosztuje. Reader, ktory juz cos aktywnie dekoduje,
+     * nie dostaje dodatkowego, niepotwierdzonego ruchu ECM na inny
+     * kanal - dopiero gdy zwolni sie calkowicie, zacznie probowac.
+     */
+    {
+      cc_service_t *ct2;
+      int busy_elsewhere = 0;
+      LIST_FOREACH(ct2, &cc->cc_services, cs_link)
+        if (((th_descrambler_t *)ct2)->td_keystate == DS_RESOLVED) {
+          busy_elsewhere = 1;
+          break;
+        }
+      if (!busy_elsewhere)
+        TAILQ_FOREACH(st, &t->s_components.set_filter, es_filter_link) {
+          if (prefpid_lock == PREFCAPID_FORCE && prefpid != st->es_pid)
+            continue;
+          LIST_FOREACH(c, &st->es_caids, link) {
+            if (!c->use || (forcecaid && forcecaid != c->caid))
+              continue;
+            if (ct) {
+              for (i = 0; i < ct->cs_bad_caid_count; i++)
+                if (ct->cs_bad_caid[i] == c->caid)
+                  break;
+              if (i < ct->cs_bad_caid_count)
+                continue;
+            }
+            break;
+          }
+          if (c) break;
+        }
+      else
+        c = NULL;
+    }
+    if (c) {
+      tvhdebug(cc->cc_subsys,
+               "%s: service \"%s\": no card confirmed for CAID %04X via "
+               "CARD_DATA - trying blindly with card_id=0 (like OSCam)",
+               cc->cc_name, ((mpegts_service_t *)t)->s_dvb_svcname, c->caid);
+      pcard = cc_new_card(cc, c->caid, 0, NULL, 0, NULL, NULL, 1);
+    }
   }
   if (!pcard) {
     if (ct) cc_service_destroy0(cc, (th_descrambler_t*)ct);
@@ -1489,6 +1719,14 @@ cc_service_start(caclient_t *cac, service_t *t)
   descrambler_change_keystate(td, DS_READY, 0);
 
 add:
+  /*
+   * nowosc: synchronizuj td_ext (descrambler.h, Status -> CA Readers
+   * kolumna "EXT") z aktualnym stanem polaczenia przy KAZDYM
+   * (re)uruchomieniu tej uslugi na tym readerze - to jedno, wspolne
+   * miejsce dla obu galezi powyzej (nowy ct i ponowne uzycie
+   * istniejacego).
+   */
+  ((th_descrambler_t *)ct)->td_ext = cc->cc_multi_ecm;
   i = 0;
   mpegts_pid_init(&epids);
   TAILQ_FOREACH(st, &t->s_components.set_filter, es_filter_link) {
@@ -1623,7 +1861,45 @@ cc_conf_changed(caclient_t *cac)
     tvh_mutex_unlock(&cc->cc_mutex);
     tvh_write(cc->cc_pipe.wr, "q", 1);
     tvh_thread_kill(tid, SIGHUP);
-    pthread_join(tid, NULL);
+    /*
+     * nowosc: diagnostyka do zawieszenia na zamknieciu (systemd
+     * "Failed with result 'timeout'" + SIGKILL po 90s, obserwowane przy
+     * aktywnym ECM race z kilkoma polaczeniami naraz - "aplikacja nie
+     * odpowiada wisi"). Zwykly pthread_join(tid, NULL) czeka tu
+     * BEZ LIMITU, trzymajac global_lock (patrz caclient_done() ->
+     * caclient_delete() -> tutaj) - jesli cc_thread z jakiegos powodu
+     * nie wyjdzie szybko (np. utkniety w blokujacym recv()/SSL na
+     * martwym polaczeniu, mimo SIGHUP), CALY proces czyszczenia
+     * zawiesza sie w nieskonczonosc, co wyglada dokladnie jak "apka
+     * wisi". Nie skracamy tu czekania (przedwczesne poddanie sie i
+     * zwolnienie cc/cac spod nog wciaz dzialajacego watku byloby GORSZE
+     * - use-after-free zamiast diagnozowalnego zawieszenia) - tylko
+     * regularnie logujemy postep, zeby przy NASTEPNYM takim przypadku
+     * log jasno pokazal, ktory reader utkl i jak dlugo, zamiast ciszy
+     * az do SIGKILL.
+     */
+    {
+      struct timespec ts;
+      int64_t t0 = mclk(), waited;
+      int rc, warned = 0;
+      do {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 2;
+        rc = pthread_timedjoin_np(tid, NULL, &ts);
+        waited = mclk() - t0;
+        if (rc == ETIMEDOUT && waited >= sec2mono(6)) {
+          tvhwarn(cc->cc_subsys,
+                  "%s: connection thread still not joined after %ds - "
+                  "possible hang on shutdown (see cc_conf_changed)",
+                  cc->cc_name, (int)(waited / 1000000));
+          warned = 1;
+        }
+      } while (rc == ETIMEDOUT);
+      if (warned)
+        tvhwarn(cc->cc_subsys,
+                "%s: connection thread finally joined after %ds",
+                cc->cc_name, (int)(waited / 1000000));
+    }
     tvh_pipe_close(&cc->cc_pipe);
     caclient_set_status(cac, CACLIENT_STATUS_NONE);
     while ((cm = TAILQ_FIRST(&cc->cc_writeq)) != NULL) {

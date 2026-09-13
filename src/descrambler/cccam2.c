@@ -470,9 +470,14 @@ cccam2_handle_partner(cccam2_t *cccam2, uint8_t *msg)
     if ((p = strtok_r(NULL, ",]", &saveptr)) == NULL)
       break;
     had_param = 1;
-    if (strncmp(p, "EXT", 3) == 0)
+    if (strncmp(p, "EXT", 3) == 0) {
       cccam2->cccam_extended = 1;
-    else if (strncmp(p, "SID", 3) == 0)
+      /* nowosc: patrz komentarz przy cc_multi_ecm w cclient.h - dopiero
+       * TERAZ, po realnym potwierdzeniu EXT przez serwer, wolno cclient.c
+       * bezpiecznie wysylac dodatkowy ("keep warm") ruch ECM race na tym
+       * polaczeniu. */
+      ((cclient_t *)cccam2)->cc_multi_ecm = 1;
+    } else if (strncmp(p, "SID", 3) == 0)
       cccam2->cccam_cansid = 1;
     else if (strncmp(p, "SLP", 3) == 0)
       cccam2->cccam_sendsleep = 1;
@@ -867,6 +872,11 @@ cccam2_init_session(void *cc)
   cccam2->cccam_extended = 0;
   cccam2->cccam_sendsleep = 0;
   cccam2->cccam_cansid = 0;
+  /* nowosc: patrz cc_multi_ecm w cclient.h - resetuj przy kazdej nowej
+   * sesji, tak samo jak cccam_extended, na wypadek gdyby po reconnect
+   * serwer PRZESTAL zglaszac EXT (np. zmiana konfiguracji po stronie
+   * serwera) */
+  ((cclient_t *)cccam2)->cc_multi_ecm = 0;
 
   /**
    * Get init seed
@@ -956,7 +966,26 @@ cccam2_send_ecm(void *cc, cc_service_t *ct, cc_ecm_section_t *es,
    * odpowiadal caly czas. Teraz dla nie-EXT wymuszamy es_seq=1, dokladnie
    * to samo, czego szuka strona odbiorcza.
    */
-  es->es_seq = cccam2->cccam_extended ? (seq & 0xff) : 1;
+  if (cccam2->cccam_extended) {
+    /*
+     * bugfix: patrz cc_seq_in_use() w cclient.c - zanim uzyjemy
+     * obcietego do 1 bajta numeru, upewnijmy sie, ze ktos inny na tym
+     * samym polaczeniu (inna, rownolegle "cieplo" utrzymywana usluga)
+     * nie ma go juz przypisanego do wciaz oczekujacej sekcji. Petla
+     * ograniczona do 256 prob - tyle wynosi cala przestrzen wartosci,
+     * wiec to gwarantowany gorny limit, nie "prawie nieskonczona"
+     * petla; w praktyce kolizja jest rzadka i pierwsza proba niemal
+     * zawsze wystarcza.
+     */
+    int candidate = seq & 0xff, tries = 0;
+    while (cc_seq_in_use((cclient_t *)cccam2, candidate, es) && tries < 256) {
+      candidate = (candidate + 1) & 0xff;
+      tries++;
+    }
+    es->es_seq = candidate;
+  } else {
+    es->es_seq = 1;
+  }
 
   buf = alloca(len + 13);
   buf[ 0] = caid >> 8;
@@ -977,15 +1006,13 @@ cccam2_send_ecm(void *cc, cc_service_t *ct, cc_ecm_section_t *es,
   if (cccam2_send_msg(cccam2, MSG_ECM_REQUEST, buf, 13 + len, 1, seq, card_id))
     return -1;
   /*
-   * nowosc: znacznik "ostatnio faktycznie wyslane" (td_ecm_last_sent,
-   * descrambler.h) do Status -> CA Readers - patrz log "ECM request
-   * actually handed to server connection" w cccam2_send_msg() powyzej,
-   * to ten sam moment, tylko dostepny tu jako pole UI zamiast wpisu w
-   * logu. Ustawiamy dopiero PO udanym cccam2_send_msg() (nie przy
-   * wczesniejszym "server is busy" powyzej - tam nic faktycznie nie
-   * wyslano).
+   * bugfix: td_ecm_last_sent bylo ustawiane tutaj, wiec kolumna "Last
+   * ECM Sent" w Status -> CA Readers dzialala TYLKO dla CCcam2 - dla
+   * cccam (starego) i cwc/newcamd zawsze pokazywala "never", mimo ze
+   * te readery tez wysylaly ECM. Przeniesione do wspolnego
+   * cc_table_input() w cclient.c, obok es->es_time - jednego miejsca,
+   * ktore widzi udany zwrot z cc_send_ecm() niezaleznie od protokolu.
    */
-  ((th_descrambler_t *)ct)->td_ecm_last_sent = mclk();
   return 0;
 }
 

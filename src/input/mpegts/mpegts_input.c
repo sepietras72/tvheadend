@@ -2111,18 +2111,38 @@ mpegts_input_status_timer ( void *p )
   htsmsg_t *e;
   int64_t subs = 0;
 
-  tvh_mutex_lock(&mi->mi_output_lock);
-  LIST_FOREACH(mmi, &mi->mi_mux_active, mmi_active_link) {
-    memset(&st, 0, sizeof(st));
-    mpegts_input_stream_status(mmi, &st);
-    mpegts_mux_instance_update_quality(mmi, &st.stats);
-    e = tvh_input_stream_create_msg(&st);
-    htsmsg_add_u32(e, "update", 1);
-    notify_by_msg("input_status", e, 1, 0);
-    subs += st.subs_count;
-    tvh_input_stream_destroy(&st);
+  /*
+   * bugfix: mtimer_thread() (main.c) trzyma global_lock przez CALY czas
+   * wykonania tego callbacku (jak mainloop() dla gtimerow) - zwykly
+   * tvh_mutex_lock(&mi->mi_output_lock) blokowal wiec global_lock W
+   * NIESKONCZONOSC, jesli akurat cokolwiek innego trzymalo
+   * mi_output_lock dluzej niz zwykle (np. mpegts_input_thread()
+   * przetwarzajacy pakiet TS pod mi_output_lock, patrz linia ~1735 w
+   * tym pliku - zlapane na zywym, zawieszonym procesie przez gdb:
+   * global_lock.mutex.__data.__owner wskazywal na ten timer, a
+   * mi_output_lock byl trzymany przez inny watek). Klasyczny AB-BA:
+   * ktokolwiek trzyma mi_output_lock i choc raz zechce global_lock,
+   * zanim je zwolni, cala reszta procesu (mainloop, wszystkie API
+   * requesty przez webui, itd. - wszystko co potrzebuje global_lock)
+   * zamarza. Status wejscia i tak odswieza sie co 1s - pominiecie
+   * JEDNEGO cyklu, gdy input jest akurat zajety, jest niezauwazalne;
+   * blokowanie na tym w nieskonczonosc, trzymajac global_lock, jest
+   * katastrofalne. Uzywamy wiec nieblokujacego tvh_mutex_trylock() -
+   * przy EBUSY po prostu pomijamy ten cykl i sprobujemy znowu za 1s.
+   */
+  if (!tvh_mutex_trylock(&mi->mi_output_lock)) {
+    LIST_FOREACH(mmi, &mi->mi_mux_active, mmi_active_link) {
+      memset(&st, 0, sizeof(st));
+      mpegts_input_stream_status(mmi, &st);
+      mpegts_mux_instance_update_quality(mmi, &st.stats);
+      e = tvh_input_stream_create_msg(&st);
+      htsmsg_add_u32(e, "update", 1);
+      notify_by_msg("input_status", e, 1, 0);
+      subs += st.subs_count;
+      tvh_input_stream_destroy(&st);
+    }
+    tvh_mutex_unlock(&mi->mi_output_lock);
   }
-  tvh_mutex_unlock(&mi->mi_output_lock);
   mtimer_arm_rel(&mi->mi_status_timer, mpegts_input_status_timer, mi, sec2mono(1));
   mpegts_input_dbus_notify(mi, subs);
 }

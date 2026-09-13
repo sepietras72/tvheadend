@@ -183,6 +183,13 @@ api_status_ca_readers
       htsmsg_add_s64(e, "ecm_sent_ago",
                      td->td_ecm_last_sent ?
                        (int64_t)((mclk() - td->td_ecm_last_sent) / 1000LL) : -1);
+      /*
+       * nowosc: czy polaczenie tego readera negocjowalo z serwerem "EXT"
+       * (wiele rownoleglych zadan ECM w locie) - patrz td_ext w
+       * descrambler.h. 0 dla wszystkiego, co tego nie negocjuje/nie
+       * dotyczy (klasyczny CCcam, capmt/OSCam lokalny, stary cccam.c).
+       */
+      htsmsg_add_u32(e, "ext", td->td_ext);
       htsmsg_add_msg(l, NULL, e);
       c++;
     }

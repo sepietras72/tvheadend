@@ -2446,3 +2446,69 @@ msgstr "{0} wybranych rzędów{1}"
 #: src/webui/static/app/tvheadend.js:735
 msgid "{3} {0} - {1} of {2}"
 msgstr "{3} {0} - {1} z {2}"
+
+#. New in Status > CA Readers (Vue) - not covered by the xgettext
+#. extraction over static/app/*.js yet, added by hand so Polish users
+#. get real translations instead of the English fallback. Identity
+#. translations (msgid == msgstr, e.g. technical abbreviations like
+#. "CAID"/"ECM OK"/"ECM NOK") are intentionally omitted - pojs.py
+#. skips them anyway (see support/pojs.py cnv()), and t()'s English
+#. fallback already produces the identical string.
+#: src/webui/static-vue/src/views/status/CaReadersView.vue
+msgid "CA Reader"
+msgstr "Czytnik CA"
+
+#: src/webui/static-vue/src/views/status/CaReadersView.vue
+msgid "Last ECM Error"
+msgstr "Ostatni błąd ECM"
+
+#: src/webui/static-vue/src/views/status/CaReadersView.vue
+msgid "ECM Time (min/avg/max/last)"
+msgstr "Czas ECM (min/śr/maks/ost.)"
+
+#: src/webui/static-vue/src/views/status/CaReadersView.vue
+msgid "Last ECM Sent"
+msgstr "Ostatnio wysłane ECM"
+
+#: src/webui/static-vue/src/views/status/CaReadersView.vue
+msgid "Standby"
+msgstr "Gotowość"
+
+#: src/webui/static-vue/src/views/status/CaReadersView.vue
+msgid "Failovers"
+msgstr "Przełączenia awaryjne"
+
+#: src/webui/static-vue/src/views/status/CaReadersView.vue
+msgid "never"
+msgstr "nigdy"
+
+#. td_ecm_last_error (descrambler.h) - raw C strings set via snprintf
+#. in cclient.c/cccam2.c/cccam.c/capmt.c/capmt2.c, shown verbatim in
+#. the "Last ECM Error" column. Translated here and looked up through
+#. t() from CaReadersView.vue's last_error column `format`, same
+#. mechanism as any other UI string - see that file for the regex
+#. that turns the one string with a dynamic seqno/delay back into the
+#. {0}/{1} template below before the t() lookup.
+#: src/descrambler/cclient.c
+msgid "NOK (seqno {0}, {1} ms)"
+msgstr "NOK (nr sekw. {0}, {1} ms)"
+
+#: src/descrambler/cclient.c
+msgid "NOK: too many retries"
+msgstr "NOK: zbyt wiele prób"
+
+#: src/descrambler/cclient.c
+msgid "NOK: already has a key for service"
+msgstr "NOK: serwer już ma klucz dla tego programu"
+
+#: src/descrambler/cclient.c
+msgid "Access denied (all ECM exhausted)"
+msgstr "Odmowa dostępu (wyczerpano wszystkie ECM)"
+
+#: src/descrambler/cccam2.c src/descrambler/cccam.c
+msgid "Request dropped: server busy (no EXT, 1 request in flight)"
+msgstr "Żądanie odrzucone: serwer zajęty (brak EXT, 1 żądanie w toku)"
+
+#: src/descrambler/capmt.c src/descrambler/capmt2.c
+msgid "Access denied (OSCam reported not ok)"
+msgstr "Odmowa dostępu (OSCam zgłosił błąd)"

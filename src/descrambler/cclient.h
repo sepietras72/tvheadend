@@ -46,10 +46,20 @@
  * nowosc: po tylu ponowieniach TEGO SAMEGO zadania ECM bez ZADNEJ
  * odpowiedzi (patrz es_silent_retries) uznajemy, ze wybrany CAID nie
  * dziala u tego dostawcy i probujemy inny (cc_try_alt_caid()) - patrz
- * cc_table_input(). 3 probki * 5s (CC_ECM_PENDING_TIMEOUT) = ok. 15s
- * calkowitej ciszy, zanim poddamy sie na tym CAID-zie.
+ * cc_table_input().
+ *
+ * bugfix: liczone tylko przy PRZYCHODZACEJ tresci ECM (zmienionej lub
+ * identycznej) - realnym tempem jest wiec okres kryptograficzny
+ * kanalu, nie CC_ECM_PENDING_TIMEOUT. Przy typowym okresie ~10s (a
+ * zaobserwowane w logach realne przypadki byly jeszcze dluzsze) 3
+ * probki to bylo w praktyce nawet ~58s calkowitej ciszy, zanim reader
+ * poddawal sie na martwym CAID-zie - dla widza to wyglada jak
+ * "zawieszenie" obrazu na prawie minute. Zmniejszone do 2 - nadal
+ * odporne na pojedynczy zgubiony/spozniony pakiet (nie reagujemy na
+ * pierwszej ciszy), ale skraca najgorszy przypadek mniej wiecej o
+ * jeden pelny okres kryptograficzny.
  */
-#define CC_MAX_SILENT_RETRIES 3
+#define CC_MAX_SILENT_RETRIES 2
 
 /**
  *
@@ -245,6 +255,24 @@ typedef struct cclient {
 
   uint8_t cc_running;
   uint8_t cc_reconfigure;
+
+  /*
+   * nowosc: czy TO polaczenie faktycznie negocjowalo z serwerem
+   * mozliwosc wielu rownoleglych zadan ECM w locie (CCcam "EXT"/OSCam
+   * rozszerzenie - patrz cccam_extended w cccam2.c, ustawiane dopiero
+   * po odebraniu "[EXT]" w odpowiedzi PARTNER: od serwera, NIE z samej
+   * lokalnej konfiguracji readera). Domyslnie 0 (bezpieczne zalozenie -
+   * klasyczny CCcam bez EXT i newcamd/cwc obsluguja tylko JEDNO zadanie
+   * ECM na raz). Uzywane w cc_ecm_reply() (cclient.c) do decyzji, czy
+   * "keep warm" (ECM race, config.descrambler_ecm_race) jest bezpieczne
+   * na tym konkretnym polaczeniu - na polaczeniu bez EXT kazde
+   * dodatkowe "podgrzewajace" zadanie zajmuje ten sam, jedyny dostepny
+   * slot co realnie potrzebne zadania dla innych, aktywnie ogladanych
+   * kanalow na tym samym readerze, wiec potrafi je "zaglodzic"
+   * (zaobserwowane: do 36s bez ECM dla kanalu na przeciazonym,
+   * klasycznym polaczeniu z kilkoma jednoczesnie aktywnymi kanalami).
+   */
+  uint8_t cc_multi_ecm;
 } cclient_t;
 
 /*
@@ -267,6 +295,16 @@ void cc_ecm_reply
 
 cc_ecm_section_t *cc_find_pending_section
   (cclient_t *cc, uint32_t seq, cc_service_t **ct);
+
+/*
+ * bugfix: patrz komentarz przy implementacji w cclient.c - pozwala
+ * nadawcy (cccam2_send_ecm()) sprawdzic PRZED uzyciem, czy kandydat na
+ * es_seq nie jest juz zajety przez INNA, wciaz oczekujaca sekcje na
+ * tym samym polaczeniu (kolizja po zawinieciu 1-bajtowego numeru w
+ * trybie EXT) - eliminuje przyczyne "Got unexpected ECM reply" u
+ * zrodla, zamiast tylko sprzatac po fakcie (cc_expire_stale_pending).
+ */
+int cc_seq_in_use(cclient_t *cc, int seq, cc_ecm_section_t *self);
 
 void cc_write_message(cclient_t *cc, cc_message_t *msg, int enq);
 int cc_read(cclient_t *cc, void *buf, size_t len, int timeout);

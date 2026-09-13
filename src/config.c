@@ -1788,8 +1788,27 @@ config_backup_periodic_run ( void *aux )
     tvherror(LS_CONFIG, "periodic backup: failed to start tar");
     return;
   }
+  /*
+   * bugfix: ta funkcja jest callbackiem mtimera (mtimer_thread(), main.c)
+   * - global_lock jest trzymany przez CALY czas jej wykonania, dokladnie
+   * jak dla mainloop()/gtimerow. Petla ponizej czekala na zakonczenie
+   * "tar" (spawn_reap()) TRZYMAJAC global_lock przez caly ten czas -
+   * zlapane na zywym, zawieszonym procesie przez gdb (mtimer utkniety
+   * w tvh_safe_usleep() wewnatrz tej wlasnie petli, global_lock.mutex.
+   * __data.__owner wskazywal na niego). Backup wiekszego configu/EPG
+   * (tar -cjf calego katalogu ustawien) moze trwac sporo dluzej niz
+   * ulamek sekundy - przez caly ten czas byl kompletnie zamrozony caly
+   * serwer (webui, API, wszystkie inne timery), bo WSZYSTKO potrzebuje
+   * global_lock. Zwalniamy go wiec na czas oczekiwania na "tar" -
+   * miedzy unlock a lock nizej nie dotykamy zadnego stanu dzielonego
+   * (tylko odpytujemy status NIEZALEZNEGO procesu potomnego), wiec jest
+   * to bezpieczne; mtimer_thread() i tak oczekuje, ze global_lock bedzie
+   * z powrotem zablokowany, gdy ta funkcja wroci.
+   */
+  tvh_mutex_unlock(&global_lock);
   while ((code = spawn_reap(pid, errtxt, sizeof(errtxt))) == -EAGAIN)
     tvh_safe_usleep(20000);
+  tvh_mutex_lock(&global_lock);
   if (code && code != -ECHILD) {
     tvherror(LS_CONFIG, "periodic backup: tar exited with code %d (%s)", code, errtxt);
     unlink(outfile);   /* nie zostawiaj polowicznego archiwum */
@@ -1813,7 +1832,19 @@ config_backup_periodic_init ( void )
 void
 config_backup_periodic_done ( void )
 {
+  /*
+   * bugfix: identyczny problem jak byl w descrambler_done()
+   * (descrambler.c) - mtimer_disarm() wymaga trzymania global_lock
+   * ("the global_lock must be held" - main.c), a config_backup_periodic_done()
+   * jest wolane z sekwencji zamykania w main.c PO tvhlog_end() (main.c),
+   * bez global_lock - niespelniona asercja lock_assert() w mtimer_disarm()
+   * wywoluje abort(). Skoro dzieje sie to PO tvhlog_end(), diagnostyka
+   * "CRASH: ..." (trap.c) nie ma juz gdzie sie zapisac w logu - std. stad
+   * pozorne "ciche" SIGABRT na zamknieciu bez zadnego sladu w journalu.
+   */
+  tvh_mutex_lock(&global_lock);
   mtimer_disarm(&config_backup_periodic_timer);
+  tvh_mutex_unlock(&global_lock);
 }
 
 /*
